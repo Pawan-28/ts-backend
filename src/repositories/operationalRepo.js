@@ -1399,16 +1399,49 @@ async function insertMeeting(data) {
 }
 
 async function updateMeeting(tenantId, meetingId, patch) {
+  // Plain scalar fields — only what's present in `patch` is touched, so an omitted
+  // field (e.g. title during a scheduledAt-only reschedule) is left exactly as-is.
+  const fieldMap = {
+    status: "status",
+    title: "title",
+    scheduledAt: "scheduled_at",
+    durationMin: "duration_min",
+    meetLink: "meet_link",
+    location: "location",
+  };
+
   const fields = [];
   const params = [meetingId, tenantId];
   let idx = 3;
-  for (const [key, col] of Object.entries({ status: "status", mom: "mom" })) {
+
+  for (const [key, col] of Object.entries(fieldMap)) {
     if (patch[key] !== undefined) {
       fields.push(`${col} = $${idx}`);
-      params.push(key === "mom" ? JSON.stringify(patch[key]) : patch[key]);
+      params.push(patch[key]);
       idx += 1;
     }
   }
+
+  // "mom" (the full structured Minutes-of-Meeting object written by addMom()) still
+  // replaces the JSON column wholesale, exactly as before. The lighter "agenda"/"note"
+  // field used by reschedule is merged into the existing mom object instead, so patching
+  // just the note doesn't wipe out decisions/actionItems already recorded via addMom().
+  if (patch.mom !== undefined) {
+    fields.push(`mom = $${idx}`);
+    params.push(JSON.stringify(patch.mom));
+    idx += 1;
+  } else if (patch.agenda !== undefined || patch.note !== undefined) {
+    const noteValue = patch.agenda !== undefined ? patch.agenda : patch.note;
+    const existing = await pool.query(
+      `SELECT mom FROM meetings WHERE id = $1 AND tenant_id = $2 LIMIT 1`,
+      [meetingId, tenantId],
+    );
+    const existingMom = existing.rows[0]?.mom || {};
+    fields.push(`mom = $${idx}`);
+    params.push(JSON.stringify({ ...existingMom, agenda: noteValue }));
+    idx += 1;
+  }
+
   if (!fields.length) return null;
   const result = await pool.query(
     `UPDATE meetings SET ${fields.join(", ")} WHERE id = $1 AND tenant_id = $2 RETURNING *`,

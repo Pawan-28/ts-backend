@@ -2,7 +2,22 @@ const pool = require("../../config/db");
 const { logger } = require("../config/logger");
 
 const DEFAULT_CALL_AI_MODEL = "gpt-4o-mini";
+
+// Distinct, clearly-labeled placeholder messages per failure reason (previously these
+// were all collapsed into one generic NO_RECORDING_MSG). Each one still contains a
+// recognizable marker so ensureAllCallsProcessedWithAi()'s Pass 2 retry query (below)
+// keeps catching and retrying them later, same as before.
 const NO_RECORDING_MSG = "No call recording available for this call.";
+const OPENAI_NOT_CONFIGURED_MSG = "[AI UNAVAILABLE] OPENAI_API_KEY is not configured on the server — no MoM was generated for this call.";
+const TRANSCRIPT_UNAVAILABLE_MSG = "[TRANSCRIPT UNAVAILABLE] The call recording could not be transcribed (no speech detected or Whisper failed) — no MoM was generated for this call.";
+const GPT_FAILED_MSG = "[GPT FAILED] AI summarization request failed — see server logs for details.";
+
+const SECTION_LABELS = {
+  callHeader: "CALL HEADER",
+  discussionHighlights: "DISCUSSION HIGHLIGHTS & KEY REQUIREMENTS",
+  qualificationsMet: "QUALIFICATIONS MET",
+  actionItems: "ACTION ITEMS & NEXT STEPS",
+};
 
 function getCallAiModel() {
   return process.env.OPENAI_CALL_MODEL || DEFAULT_CALL_AI_MODEL;
@@ -75,6 +90,19 @@ function buildSopGuidanceBlock(sop) {
   return { label: `${sop.title} (${sop.category || "Sales Call"})`, text: lines.join("\n\n") };
 }
 
+/** Flatten the structured 4-section summary object into the bracket-tagged plain-text
+ *  format the ai_summary TEXT column (and existing frontend rendering) already expects —
+ *  same convention already used by the "Not Connected" template below. Falls back to a
+ *  plain string as-is if the model didn't return the expected object shape. */
+function flattenSummaryForStorage(rawSummary) {
+  if (rawSummary && typeof rawSummary === "object" && !Array.isArray(rawSummary)) {
+    return Object.entries(rawSummary)
+      .map(([k, v]) => `[${SECTION_LABELS[k] || k.toUpperCase()}]\n${typeof v === "object" ? JSON.stringify(v, null, 2) : v}`)
+      .join("\n\n");
+  }
+  return String(rawSummary ?? "");
+}
+
 async function processCallWithAi(tenantId, callId) {
   const apiKey = process.env.OPENAI_API_KEY;
 
@@ -87,7 +115,9 @@ async function processCallWithAi(tenantId, callId) {
     [callId, tenantId]
   );
   if (callRes.rows.length === 0) {
-    throw new Error("Call log not found");
+    const err = new Error("Call log not found");
+    err.status = 404;
+    throw err;
   }
   const call = callRes.rows[0];
   const leadService = extractServiceFromRequirements(call.lead_requirements);
@@ -117,16 +147,27 @@ async function processCallWithAi(tenantId, callId) {
     : (rawOutcome || "Connected");
 
   let transcript = "";
+  let transcriptSource = null; // "existing" | "whisper" | null
   let summaryText = NO_RECORDING_MSG;
+  let structuredSummary = null;
   let sentiment = "neutral";
   let rating = 0;
   let temperature = "Warm Lead";
   let checklistProgress = [];
   let competencyScores = {};
 
+  const existingTranscript = String(call.transcript || "").trim();
+  const hasUsableTranscript = Boolean(existingTranscript);
   const hasRecording = Boolean(call.recording_url && String(call.recording_url).trim());
 
-  if (isNotConnected || !hasRecording) {
+  if (hasUsableTranscript) {
+    // Transcript/words are already on the call record (e.g. supplied by the call source
+    // directly, or entered previously) — use that text for GPT directly. Do NOT require a
+    // recording URL, and do NOT re-run Whisper, when we already have usable transcript text.
+    logger.info("Using existing transcript already present on the call record — skipping Whisper", { callId });
+    transcript = existingTranscript;
+    transcriptSource = "existing";
+  } else if (isNotConnected || !hasRecording) {
     logger.info("Call is not connected or no recording present — set clear Not Connected summary", { callId });
     summaryText = `[CALL STATUS: NOT CONNECTED]
 • Client: ${clientName}
@@ -142,10 +183,13 @@ async function processCallWithAi(tenantId, callId) {
     transcript = "";
     rating = 0;
   } else {
-    // Has audio recording URL! Transcribe using Whisper
-    if (apiKey) {
+    // No existing transcript, but a recording URL exists — transcribe with Whisper.
+    if (!apiKey) {
+      logger.warn("OPENAI_API_KEY not configured — cannot transcribe recording", { callId });
+      summaryText = OPENAI_NOT_CONFIGURED_MSG;
+    } else {
       try {
-        logger.info("Downloading audio recording for Whisper transcription", { recordingUrl: call.recording_url });
+        logger.info("Downloading audio recording for Whisper transcription", { callId, recordingUrl: call.recording_url });
         const audioRes = await fetch(call.recording_url);
         if (audioRes.ok) {
           const arrayBuffer = await audioRes.arrayBuffer();
@@ -165,22 +209,35 @@ async function processCallWithAi(tenantId, callId) {
           if (whisperRes.ok) {
             const whisperData = await whisperRes.json();
             transcript = (whisperData.text || "").trim();
+            if (transcript) transcriptSource = "whisper";
+          } else {
+            const errText = await whisperRes.text().catch(() => "");
+            logger.warn("Whisper transcription request failed", { callId, status: whisperRes.status, error: errText });
           }
+        } else {
+          logger.warn("Could not download call recording for transcription", { callId, status: audioRes.status });
         }
       } catch (err) {
-        logger.warn("Whisper transcription failed for recording", { error: err.message });
+        logger.warn("Whisper transcription failed for recording", { callId, error: err.message });
+      }
+
+      if (!transcript) {
+        summaryText = TRANSCRIPT_UNAVAILABLE_MSG;
       }
     }
+  }
 
-    if (!transcript) {
-      // Audio could not be transcribed or had no spoken speech
-      summaryText = NO_RECORDING_MSG;
-      transcript = "";
+  // GPT summarization — runs whenever we ended up with usable transcript text, regardless
+  // of whether it came from the call record directly or from Whisper above.
+  if (transcript) {
+    if (!apiKey) {
+      logger.warn("OPENAI_API_KEY not configured — cannot generate MoM from transcript", { callId });
+      summaryText = OPENAI_NOT_CONFIGURED_MSG;
     } else {
-      // Real Whisper transcript obtained! Pass to GPT to generate genuine MoM
+      const transcriptFallbackTag = transcriptSource === "existing" ? "[TRANSCRIPT ON FILE]" : "[REAL AUDIO TRANSCRIPT]";
       try {
         const callAiModel = getCallAiModel();
-        logger.info("Generating REAL MoM from audio transcript with GPT", { callId });
+        logger.info("Generating MoM from transcript with GPT", { callId, transcriptSource, model: callAiModel });
         const gptRes = await fetch("https://api.openai.com/v1/chat/completions", {
           method: "POST",
           headers: {
@@ -193,19 +250,18 @@ async function processCallWithAi(tenantId, callId) {
             messages: [
               {
                 role: "system",
-                content: `You are an AI sales compliance & MoM generator for TS Publications CRM. Analyze the REAL audio transcript below for client "${clientName}".
+                content: `You are an AI sales compliance & MoM generator for TS Publications CRM. Analyze the REAL transcript below for client "${clientName}".
 Generate a structured Minutes of Meeting (MoM) containing ONLY facts discussed in the transcript.
-Do NOT invent or hallucinate facts outside the audio transcript.
+Do NOT invent or hallucinate facts outside the transcript.
 
 ${sopGuidance.text}
 
 Generate:
-1. "summary": A structured Minutes of Meeting (MoM):
-   - Call Header (Date: ${dateStr}, Time: ${timeStr}, Client: ${clientName}, Duration: ${durationStr})
-   ${sopGuidance.label ? `- SOP Guidance Used: ${sopGuidance.label}` : ""}
-   - Discussion Highlights & Key Requirements
-   - Qualifications Met: go through the SOP's qualification checklist above (if any) and state which items were actually covered on the call and which were missed — quote or paraphrase where each was addressed
-   - Action Items & Next Steps
+1. "summary": a JSON OBJECT (not a single string) with EXACTLY these four keys, each a string:
+   - "callHeader": one line covering Date: ${dateStr}, Time: ${timeStr}, Client: ${clientName}, Duration: ${durationStr}${sopGuidance.label ? `, SOP Guidance Used: ${sopGuidance.label}` : ""}
+   - "discussionHighlights": Discussion Highlights & Key Requirements from the call
+   - "qualificationsMet": go through the SOP's qualification checklist above (if any) and state which items were actually covered on the call and which were missed — quote or paraphrase where each was addressed
+   - "actionItems": Action Items & Next Steps
 2. "sentiment": "positive" | "neutral" | "negative"
 3. "rating": integer 1-5
 4. "temperature": "Hot Lead" | "Warm Lead" | "Cold Lead"
@@ -220,7 +276,12 @@ Generate:
 
 Return JSON with exact keys:
 {
-  "summary": "...",
+  "summary": {
+    "callHeader": "...",
+    "discussionHighlights": "...",
+    "qualificationsMet": "...",
+    "actionItems": "..."
+  },
   "sentiment": "positive",
   "rating": 5,
   "temperature": "Hot Lead",
@@ -236,7 +297,7 @@ Return JSON with exact keys:
               },
               {
                 role: "user",
-                content: `Real Audio Transcript:\n${transcript}`,
+                content: `Real Transcript:\n${transcript}`,
               },
             ],
           }),
@@ -244,43 +305,70 @@ Return JSON with exact keys:
 
         if (gptRes.ok) {
           const gptData = await gptRes.json();
-          const analysis = JSON.parse(gptData.choices[0].message.content);
-          const rawSummary = analysis.summary || transcript;
-          summaryText = typeof rawSummary === "object"
-            ? Object.entries(rawSummary).map(([k, v]) => `[${k}]\n${typeof v === "object" ? JSON.stringify(v, null, 2) : v}`).join("\n\n")
-            : String(rawSummary);
-          sentiment = analysis.sentiment || "positive";
-          rating = Number(analysis.rating) || 5;
-          temperature = analysis.temperature || "Warm Lead";
-          checklistProgress = Array.isArray(analysis.checklistProgress) ? analysis.checklistProgress : [];
-          competencyScores = (analysis.competencyScores && typeof analysis.competencyScores === "object")
-            ? analysis.competencyScores
-            : {};
+          const content = gptData?.choices?.[0]?.message?.content;
+          if (!content) {
+            logger.error("GPT returned an empty response body", { callId, gptData });
+            summaryText = `${transcriptFallbackTag}\nCall Date: ${dateStr} at ${timeStr}\nDuration: ${durationStr}\n\n${transcript}`;
+          } else {
+            let analysis;
+            try {
+              analysis = JSON.parse(content);
+            } catch (parseErr) {
+              logger.error("GPT returned invalid JSON", { callId, error: parseErr.message, content });
+              analysis = null;
+            }
+            if (!analysis || typeof analysis !== "object") {
+              summaryText = `${transcriptFallbackTag}\nCall Date: ${dateStr} at ${timeStr}\nDuration: ${durationStr}\n\n${transcript}`;
+            } else {
+              const rawSummary = analysis.summary ?? transcript;
+              if (rawSummary && typeof rawSummary === "object" && !Array.isArray(rawSummary)) {
+                structuredSummary = rawSummary;
+              }
+              summaryText = flattenSummaryForStorage(rawSummary);
+              sentiment = analysis.sentiment || "positive";
+              rating = Number(analysis.rating) || 5;
+              temperature = analysis.temperature || "Warm Lead";
+              checklistProgress = Array.isArray(analysis.checklistProgress) ? analysis.checklistProgress : [];
+              competencyScores = (analysis.competencyScores && typeof analysis.competencyScores === "object")
+                ? analysis.competencyScores
+                : {};
+            }
+          }
         } else {
-          summaryText = `[REAL AUDIO TRANSCRIPT]\nCall Date: ${dateStr} at ${timeStr}\nDuration: ${durationStr}\n\n${transcript}`;
+          const errText = await gptRes.text().catch(() => "");
+          logger.error("GPT API request failed", { callId, status: gptRes.status, error: errText });
+          summaryText = `${transcriptFallbackTag}\nCall Date: ${dateStr} at ${timeStr}\nDuration: ${durationStr}\n\n${transcript}`;
         }
       } catch (err) {
-        summaryText = `[REAL AUDIO TRANSCRIPT]\nCall Date: ${dateStr} at ${timeStr}\nDuration: ${durationStr}\n\n${transcript}`;
+        logger.error("GPT summarization threw an error", { callId, error: err.message });
+        summaryText = `${transcriptFallbackTag}\nCall Date: ${dateStr} at ${timeStr}\nDuration: ${durationStr}\n\n${transcript}`;
       }
     }
   }
 
   // Update employee_calls in DB
-  await pool.query(
-    `UPDATE employee_calls
-     SET transcript = $1, notes = $2, ai_summary = $3, outcome = $4, duration_sec = COALESCE(NULLIF(duration_sec, 0), $5),
-         sop_id = $6, checklist_progress = $7, competency_scores = $8
-     WHERE id = $9`,
-    [
-      String(transcript), summaryText, summaryText, effectiveOutcome, durationSec,
-      matchedSop?.id || null, JSON.stringify(checklistProgress), JSON.stringify(competencyScores), callId,
-    ]
-  );
+  try {
+    await pool.query(
+      `UPDATE employee_calls
+       SET transcript = $1, notes = $2, ai_summary = $3, outcome = $4, duration_sec = COALESCE(NULLIF(duration_sec, 0), $5),
+           sop_id = $6, checklist_progress = $7, competency_scores = $8
+       WHERE id = $9`,
+      [
+        String(transcript), summaryText, summaryText, effectiveOutcome, durationSec,
+        matchedSop?.id || null, JSON.stringify(checklistProgress), JSON.stringify(competencyScores), callId,
+      ]
+    );
+  } catch (err) {
+    logger.error("Failed to save AI analysis results to employee_calls", { callId, error: err.message });
+    const wrapped = new Error(`Failed to save AI analysis results: ${err.message}`);
+    wrapped.status = 500;
+    throw wrapped;
+  }
 
   // Update lead in DB if real recording transcript was processed
-  if (call.lead_id && hasRecording && transcript) {
+  if (call.lead_id && transcript && transcriptSource) {
     await pool.query(
-      `UPDATE leads 
+      `UPDATE leads
        SET temperature = $1, status = COALESCE(NULLIF(status, ''), 'contacted'), updated_at = NOW()
        WHERE id = $2`,
       [temperature, call.lead_id]
@@ -291,16 +379,19 @@ Return JSON with exact keys:
     "SELECT * FROM employee_calls WHERE id = $1 LIMIT 1",
     [callId]
   );
-  return updatedRes.rows[0];
+  // structuredSummary carries the 4-section object (callHeader/discussionHighlights/
+  // qualificationsMet/actionItems) alongside the flattened ai_summary text already on the
+  // row, so API consumers get real structure without any schema change — ai_summary
+  // itself stays a plain TEXT column, unchanged, fully backward compatible with old rows.
+  return { ...updatedRes.rows[0], structuredSummary };
 }
 
 async function ensureAllCallsProcessedWithAi(tenantId = "default") {
-  const NO_RECORDING_MSG_PATTERN = "No call recording";
   try {
     // Pass 1: calls with no ai_summary at all (null or empty)
     const unanalyzed = await pool.query(
-      `SELECT id FROM employee_calls 
-       WHERE (tenant_id = $1 OR tenant_id IS NULL) 
+      `SELECT id FROM employee_calls
+       WHERE (tenant_id = $1 OR tenant_id IS NULL)
          AND (ai_summary IS NULL OR ai_summary = '' OR notes IS NULL OR notes = '')
        ORDER BY id DESC LIMIT 100`,
       [tenantId]
@@ -313,16 +404,22 @@ async function ensureAllCallsProcessedWithAi(tenantId = "default") {
       }
     }
 
-    // Pass 2: calls that HAVE a recording_url but still show placeholder/no-recording message
-    // These occur when AI ran before the recording was available
+    // Pass 2: calls that HAVE a recording_url but still show a placeholder/failure message
+    // instead of a real summary. These occur when AI ran before the recording was
+    // available, or a transient Whisper/GPT/config failure left a placeholder behind —
+    // all of the placeholder markers used above are included here so every one of them
+    // gets retried once the underlying condition (recording, API key, etc.) is fixed.
     const recordingButPlaceholder = await pool.query(
-      `SELECT id FROM employee_calls 
-       WHERE (tenant_id = $1 OR tenant_id IS NULL) 
+      `SELECT id FROM employee_calls
+       WHERE (tenant_id = $1 OR tenant_id IS NULL)
          AND recording_url IS NOT NULL AND recording_url <> ''
          AND (
            ai_summary IS NULL OR ai_summary = ''
            OR ai_summary LIKE '%No call recording%'
            OR ai_summary LIKE '%no_summary%'
+           OR ai_summary LIKE '%[AI UNAVAILABLE]%'
+           OR ai_summary LIKE '%[TRANSCRIPT UNAVAILABLE]%'
+           OR ai_summary LIKE '%[GPT FAILED]%'
            OR notes LIKE '%No call recording%'
          )
        ORDER BY id DESC LIMIT 100`,

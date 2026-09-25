@@ -116,7 +116,14 @@ const meetingSchema = z.object({
 });
 
 const meetingPatchSchema = z.object({
-  status: z.enum(["scheduled", "completed", "cancelled"]),
+  status: z.enum(["scheduled", "completed", "cancelled"]).optional(),
+  title: z.string().min(1).optional(),
+  scheduledAt: z.coerce.date().optional(),
+  durationMin: z.coerce.number().optional(),
+  meetLink: z.string().optional().nullable(),
+  location: z.string().optional().nullable(),
+  agenda: z.string().optional().nullable(),
+  note: z.string().optional().nullable(),
 });
 
 const momSchema = z.object({

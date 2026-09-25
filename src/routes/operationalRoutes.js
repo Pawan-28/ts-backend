@@ -56,6 +56,8 @@ const {
   scheduleLeadAssignments,
 } = require("../services/operationalServices");
 const callyzer = require("../services/callyzerService");
+const n8nWebhookService = require("../services/n8nWebhookService");
+const { logger } = require("../config/logger");
 const {
   buildPipelineBoardPayload,
   formatDbCallsForEmployee,
@@ -1058,6 +1060,42 @@ router.post("/employee/meetings", validate(meetingSchema), requireEmployeeSelfBo
   if (!meeting?.id) {
     return res.status(500).json({ success: false, message: "Meeting insert failed — no id returned" });
   }
+
+  // Move the lead to Meeting Booked using the existing canonical stage-transition
+  // service — same audit/timeline/realtime behavior as any other stage change. Only for
+  // meetings booked directly through this manual endpoint: meetings created from an
+  // n8n-originated lead already have their own stage set by that webhook's rawStage, so
+  // we don't want to fight that here.
+  try {
+    await updateLeadStage({
+      tenantId,
+      leadId: req.body.leadId,
+      stage: "Meeting Booked",
+      actor: actor(req),
+    });
+  } catch (err) {
+    logger.error("Failed to move lead to Meeting Booked after manual booking", {
+      meetingId: meeting.id,
+      leadId: req.body.leadId,
+      error: err.message,
+    });
+  }
+
+  // Fire the outbound n8n "booked" webhook after the meeting is durably saved. A webhook
+  // failure must never undo the already-successful meeting save — log and move on.
+  try {
+    const [lead, employee] = await Promise.all([
+      repo.findLeadById(tenantId, req.body.leadId),
+      repo.findEmployeeById(tenantId, req.body.employeeId),
+    ]);
+    await n8nWebhookService.sendMeetingBookedWebhook({ meeting, lead, employee });
+  } catch (err) {
+    logger.error("n8n meeting-booked webhook failed (meeting save unaffected)", {
+      meetingId: meeting.id,
+      error: err.message,
+    });
+  }
+
   return ok(res, meeting);
 }));
 
@@ -1068,6 +1106,26 @@ router.patch("/employee/meetings/:id", validate(meetingPatchSchema), asyncRoute(
   if (!denyUnlessSelfOrAdmin(req, res, existing.employeeId)) return;
   const meeting = await repo.updateMeeting(tenantId, req.params.id, req.body);
   if (!meeting) return res.status(404).json({ success: false, message: "Meeting not found" });
+
+  // Only a real reschedule (date/time or link actually changing) fires the "rescheduled"
+  // webhook — a status-only patch (e.g. the existing cancel flow, {status:"cancelled"})
+  // goes through this same endpoint and must NOT trigger it.
+  const isReschedule = req.body.scheduledAt !== undefined || req.body.meetLink !== undefined;
+  if (isReschedule) {
+    try {
+      const [lead, employee] = await Promise.all([
+        repo.findLeadById(tenantId, meeting.leadId),
+        repo.findEmployeeById(tenantId, meeting.employeeId),
+      ]);
+      await n8nWebhookService.sendMeetingRescheduledWebhook({ meeting, lead, employee });
+    } catch (err) {
+      logger.error("n8n meeting-rescheduled webhook failed (DB update unaffected)", {
+        meetingId: meeting.id,
+        error: err.message,
+      });
+    }
+  }
+
   return ok(res, meeting);
 }));
 

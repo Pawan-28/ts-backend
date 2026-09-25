@@ -94,6 +94,7 @@ app.use("/api/activity", activityRoutes);
 app.use("/api/services", servicesRoutes);
 app.use("/api/forms", formsRoutes);
 app.use("/api/ai", aiRoutes);
+app.use("/api/v1/ai", aiRoutes);
 app.use("/api/v1", googleRoutes);
 app.use("/api/v1", operationalRoutes);
 mountSwagger(app);

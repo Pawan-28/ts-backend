@@ -38,7 +38,7 @@ const processCallAi = async (req, res) => {
     const updatedCall = await processCallWithAi(tenantId, callId);
     res.json({ success: true, call: updatedCall });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    res.status(err.status || 500).json({ success: false, message: err.message });
   }
 };
 
