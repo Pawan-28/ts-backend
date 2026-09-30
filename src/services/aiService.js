@@ -17,6 +17,7 @@ const GEMINI_INLINE_AUDIO_MAX_BYTES = 14 * 1024 * 1024;
 const NO_RECORDING_MSG = "No call recording available for this call.";
 const GEMINI_NOT_CONFIGURED_MSG = "[AI UNAVAILABLE] GEMINI_API_KEY is not configured on the server — no MoM was generated for this call.";
 const TRANSCRIPT_UNAVAILABLE_MSG = "[TRANSCRIPT UNAVAILABLE] The call recording could not be transcribed (no speech detected or Gemini transcription failed) — no MoM was generated for this call.";
+const AI_SUMMARY_PENDING_TAG = "[AI SUMMARY PENDING]";
 const GPT_FAILED_MSG = "[GPT FAILED] AI summarization request failed — see server logs for details.";
 
 const SECTION_LABELS = {
@@ -346,12 +347,16 @@ async function processCallWithAi(tenantId, callId) {
       logger.warn("GEMINI_API_KEY not configured — cannot generate MoM from transcript", { callId });
       summaryText = GEMINI_NOT_CONFIGURED_MSG;
     } else {
-      const transcriptFallbackTag = transcriptSource === "existing" ? "[TRANSCRIPT ON FILE]" : "[REAL AUDIO TRANSCRIPT]";
+      // If Gemini fails, store a short English placeholder (NOT the raw Hindi/Hinglish
+      // transcript — that stays in the transcript column). The marker lets the
+      // background retry pick it up again.
+      const aiPendingSummary = `${AI_SUMMARY_PENDING_TAG}\nCall Date: ${dateStr} at ${timeStr}\nDuration: ${durationStr}\n\nThe AI summary for this call could not be generated yet. Click "Re-process AI MoM" to try again.`;
       try {
         const callAiModel = getCallAiModel();
         logger.info("Generating MoM from transcript with Gemini", { callId, transcriptSource, model: callAiModel });
         const systemPrompt = `You are an AI sales compliance & MoM generator for TS Publications CRM. Analyze the REAL transcript below for client "${clientName}".
 Generate a structured Minutes of Meeting (MoM) containing ONLY facts discussed in the transcript.
+LANGUAGE: The transcript may be in Hindi, Hinglish or English. Write EVERY text value in your JSON output (all summary sections, checklist notes) in clear, professional ENGLISH — translate anything said in Hindi/Hinglish. Never use Devanagari script. Keep names, amounts (e.g. ₹45,000 + 18% GST) and numbers exactly as stated.
 Do NOT invent or hallucinate facts outside the transcript.
 
 ${sopGuidance.text}
@@ -412,7 +417,7 @@ Return JSON with exact keys:
               finishReason: geminiRes.data?.candidates?.[0]?.finishReason || null,
               blockReason: geminiRes.data?.promptFeedback?.blockReason || null,
             });
-            summaryText = `${transcriptFallbackTag}\nCall Date: ${dateStr} at ${timeStr}\nDuration: ${durationStr}\n\n${transcript}`;
+            summaryText = aiPendingSummary;
           } else {
             let analysis;
             try {
@@ -423,7 +428,7 @@ Return JSON with exact keys:
               analysis = null;
             }
             if (!analysis || typeof analysis !== "object") {
-              summaryText = `${transcriptFallbackTag}\nCall Date: ${dateStr} at ${timeStr}\nDuration: ${durationStr}\n\n${transcript}`;
+              summaryText = aiPendingSummary;
             } else {
               const rawSummary = analysis.summary ?? transcript;
               if (rawSummary && typeof rawSummary === "object" && !Array.isArray(rawSummary)) {
@@ -441,11 +446,11 @@ Return JSON with exact keys:
           }
         } else {
           logger.error("Gemini API request failed", { callId, status: geminiRes.status, error: geminiRes.errorText });
-          summaryText = `${transcriptFallbackTag}\nCall Date: ${dateStr} at ${timeStr}\nDuration: ${durationStr}\n\n${transcript}`;
+          summaryText = aiPendingSummary;
         }
       } catch (err) {
         logger.error("Gemini summarization threw an error", { callId, error: err.message });
-        summaryText = `${transcriptFallbackTag}\nCall Date: ${dateStr} at ${timeStr}\nDuration: ${durationStr}\n\n${transcript}`;
+        summaryText = aiPendingSummary;
       }
     }
   }
@@ -516,15 +521,29 @@ async function ensureAllCallsProcessedWithAi(tenantId = "default") {
     const recordingButPlaceholder = await pool.query(
       `SELECT id FROM employee_calls
        WHERE (tenant_id = $1 OR tenant_id IS NULL)
-         AND recording_url IS NOT NULL AND recording_url <> ''
          AND (
-           ai_summary IS NULL OR ai_summary = ''
-           OR ai_summary LIKE '%No call recording%'
-           OR ai_summary LIKE '%no_summary%'
-           OR ai_summary LIKE '%[AI UNAVAILABLE]%'
-           OR ai_summary LIKE '%[TRANSCRIPT UNAVAILABLE]%'
-           OR ai_summary LIKE '%[GPT FAILED]%'
-           OR notes LIKE '%No call recording%'
+           (
+             recording_url IS NOT NULL AND recording_url <> ''
+             AND (
+               ai_summary IS NULL OR ai_summary = ''
+               OR ai_summary LIKE '%No call recording%'
+               OR ai_summary LIKE '%no_summary%'
+               OR ai_summary LIKE '%[AI UNAVAILABLE]%'
+               OR ai_summary LIKE '%[TRANSCRIPT UNAVAILABLE]%'
+               OR ai_summary LIKE '%[GPT FAILED]%'
+               OR notes LIKE '%No call recording%'
+             )
+           )
+           -- Summaries that fell back to the raw (often Hindi) transcript, or the new
+           -- English "pending" placeholder: regenerate as a proper English MoM.
+           OR (
+             transcript IS NOT NULL AND transcript <> ''
+             AND (
+               ai_summary LIKE '[TRANSCRIPT ON FILE]%'
+               OR ai_summary LIKE '[REAL AUDIO TRANSCRIPT]%'
+               OR ai_summary LIKE '[AI SUMMARY PENDING]%'
+             )
+           )
          )
        ORDER BY id DESC LIMIT 100`,
       [tenantId]
