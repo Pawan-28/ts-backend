@@ -27,6 +27,12 @@ const {
 const pool = require("../../config/db");
 const { queryCallStats } = require("../utils/employeeCallStats");
 const { isValidDateKey } = require("../utils/periodFilter");
+const {
+  buildClarityCallTitle,
+  cleanServiceName,
+  resolveCustomerName,
+  resolveLeadServiceName,
+} = require("../utils/meetingTitle");
 const { isDateKeyInPeriod, localDateKey: periodLocalDateKey } = require("../utils/periodDateKeys");
 const { requirePg } = require("../middleware/pgReady");
 const {
@@ -917,8 +923,8 @@ router.get("/employee/:employeeId/pipeline/board", requireEmployeeSelf(), asyncR
       const raw = m.scheduledAt || m.date;
       if (!raw) return period === "month";
       const rawStr = String(raw);
-      // "YYYY-MM-DD HH:mm:ss" rows are already IST wall-clock (toLocalSqlString).
-      const key = /^\d{4}-\d{2}-\d{2} /.test(rawStr) ? rawStr.slice(0, 10) : periodLocalDateKey(new Date(rawStr));
+      // Naive "YYYY-MM-DD[T ]HH:mm:ss" (toLocalSqlString) is already IST wall-clock.
+      const key = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?$/.test(rawStr) ? rawStr.slice(0, 10) : periodLocalDateKey(new Date(rawStr));
       return isDateKeyInPeriod(key, period, new Date(), customRange);
     });
     payload.totals = { ...(payload.totals || {}), meetings: payload.meetings.length };
@@ -1103,7 +1109,19 @@ router.post("/employee/meetings", validate(meetingSchema), requireEmployeeSelfBo
   if (!employee) {
     return res.status(400).json({ success: false, message: `Employee ${req.body.employeeId} not found` });
   }
-  const meeting = await createMeeting({ tenantId, data: req.body, actor: actor(req) });
+  // Automatic title for every CRM-booked meeting (Pipeline drag → Meeting Booked,
+  // Meetings page → + Book Meeting, Lead Details → Book Meeting all post here):
+  // "{Customer Name} {Service Name} - Clarity Call". The same string is passed to
+  // Google Calendar/Meet (createMeeting), saved in DB and sent to n8n.
+  const serviceName = cleanServiceName(req.body.service) || resolveLeadServiceName(lead);
+  const meetingData = {
+    ...req.body,
+    title: buildClarityCallTitle(resolveCustomerName(lead), serviceName),
+  };
+  delete meetingData.service;
+  // createMeeting throws if Google Meet/Calendar creation or the DB insert fails, so
+  // nothing below (stage move, n8n webhook) runs for a failed booking.
+  const meeting = await createMeeting({ tenantId, data: meetingData, actor: actor(req) });
   if (!meeting?.id) {
     return res.status(500).json({ success: false, message: "Meeting insert failed — no id returned" });
   }
@@ -1135,7 +1153,7 @@ router.post("/employee/meetings", validate(meetingSchema), requireEmployeeSelfBo
       repo.findLeadById(tenantId, req.body.leadId),
       repo.findEmployeeById(tenantId, req.body.employeeId),
     ]);
-    await n8nWebhookService.sendMeetingBookedWebhook({ meeting, lead, employee });
+    await n8nWebhookService.sendMeetingBookedWebhook({ meeting, lead, employee, serviceName });
   } catch (err) {
     logger.error("n8n meeting-booked webhook failed (meeting save unaffected)", {
       meetingId: meeting.id,
@@ -1164,7 +1182,12 @@ router.patch("/employee/meetings/:id", validate(meetingPatchSchema), asyncRoute(
         repo.findLeadById(tenantId, meeting.leadId),
         repo.findEmployeeById(tenantId, meeting.employeeId),
       ]);
-      await n8nWebhookService.sendMeetingRescheduledWebhook({ meeting, lead, employee });
+      await n8nWebhookService.sendMeetingRescheduledWebhook({
+        meeting,
+        lead,
+        employee,
+        serviceName: n8nWebhookService.serviceFromMeeting(meeting) || resolveLeadServiceName(lead),
+      });
     } catch (err) {
       logger.error("n8n meeting-rescheduled webhook failed (DB update unaffected)", {
         meetingId: meeting.id,

@@ -1,15 +1,22 @@
 const pool = require("../../config/db");
 const { logger } = require("../config/logger");
 
-const DEFAULT_CALL_AI_MODEL = "gpt-4o-mini";
+// AI Call Summary & MoM now runs on Google Gemini (was OpenAI Whisper + gpt-4o-mini).
+// Key comes from the server environment only (GEMINI_API_KEY) — never sent to the
+// frontend and never logged. The model can be overridden with GEMINI_CALL_MODEL.
+const DEFAULT_CALL_AI_MODEL = "gemini-2.5-flash";
+const GEMINI_API_BASE = "https://generativelanguage.googleapis.com";
+// Inline audio must keep the whole request under ~20 MB; larger recordings go
+// through the Gemini Files API instead.
+const GEMINI_INLINE_AUDIO_MAX_BYTES = 14 * 1024 * 1024;
 
 // Distinct, clearly-labeled placeholder messages per failure reason (previously these
 // were all collapsed into one generic NO_RECORDING_MSG). Each one still contains a
 // recognizable marker so ensureAllCallsProcessedWithAi()'s Pass 2 retry query (below)
 // keeps catching and retrying them later, same as before.
 const NO_RECORDING_MSG = "No call recording available for this call.";
-const OPENAI_NOT_CONFIGURED_MSG = "[AI UNAVAILABLE] OPENAI_API_KEY is not configured on the server — no MoM was generated for this call.";
-const TRANSCRIPT_UNAVAILABLE_MSG = "[TRANSCRIPT UNAVAILABLE] The call recording could not be transcribed (no speech detected or Whisper failed) — no MoM was generated for this call.";
+const GEMINI_NOT_CONFIGURED_MSG = "[AI UNAVAILABLE] GEMINI_API_KEY is not configured on the server — no MoM was generated for this call.";
+const TRANSCRIPT_UNAVAILABLE_MSG = "[TRANSCRIPT UNAVAILABLE] The call recording could not be transcribed (no speech detected or Gemini transcription failed) — no MoM was generated for this call.";
 const GPT_FAILED_MSG = "[GPT FAILED] AI summarization request failed — see server logs for details.";
 
 const SECTION_LABELS = {
@@ -20,7 +27,134 @@ const SECTION_LABELS = {
 };
 
 function getCallAiModel() {
-  return process.env.OPENAI_CALL_MODEL || DEFAULT_CALL_AI_MODEL;
+  return (process.env.GEMINI_CALL_MODEL || DEFAULT_CALL_AI_MODEL).trim();
+}
+
+function getGeminiApiKey() {
+  return (process.env.GEMINI_API_KEY || "").trim();
+}
+
+function geminiHeaders(apiKey, extra = {}) {
+  // Key travels in a header (not the URL) so it never shows up in logged URLs.
+  return { "x-goog-api-key": apiKey, ...extra };
+}
+
+/** Concatenate the text parts of the first Gemini candidate. */
+function geminiResponseText(data) {
+  const parts = data?.candidates?.[0]?.content?.parts;
+  if (!Array.isArray(parts)) return "";
+  return parts.map((p) => (typeof p?.text === "string" ? p.text : "")).join("").trim();
+}
+
+/** POST models/{model}:generateContent — returns { ok, status, data, errorText }. */
+async function geminiGenerateContent(apiKey, body) {
+  const model = getCallAiModel();
+  const res = await fetch(`${GEMINI_API_BASE}/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+    method: "POST",
+    headers: geminiHeaders(apiKey, { "Content-Type": "application/json" }),
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const errorText = await res.text().catch(() => "");
+    return { ok: false, status: res.status, data: null, errorText: errorText.slice(0, 1000) };
+  }
+  return { ok: true, status: res.status, data: await res.json(), errorText: "" };
+}
+
+function audioMimeType(contentType, url) {
+  const ct = String(contentType || "").split(";")[0].trim().toLowerCase();
+  if (ct.startsWith("audio/")) return ct === "audio/mp3" ? "audio/mpeg" : ct;
+  const ext = String(url || "").split("?")[0].split(".").pop().toLowerCase();
+  const byExt = {
+    mp3: "audio/mpeg", wav: "audio/wav", m4a: "audio/mp4", mp4: "audio/mp4", aac: "audio/aac",
+    ogg: "audio/ogg", amr: "audio/amr", flac: "audio/flac", webm: "audio/webm", "3gp": "audio/3gpp",
+  };
+  return byExt[ext] || "audio/mpeg";
+}
+
+/** Upload a large recording through the Gemini Files API; returns { uri, mimeType }. */
+async function geminiUploadFile(apiKey, buffer, mimeType, displayName) {
+  const start = await fetch(`${GEMINI_API_BASE}/upload/v1beta/files`, {
+    method: "POST",
+    headers: geminiHeaders(apiKey, {
+      "X-Goog-Upload-Protocol": "resumable",
+      "X-Goog-Upload-Command": "start",
+      "X-Goog-Upload-Header-Content-Length": String(buffer.length),
+      "X-Goog-Upload-Header-Content-Type": mimeType,
+      "Content-Type": "application/json",
+    }),
+    body: JSON.stringify({ file: { display_name: displayName } }),
+  });
+  const uploadUrl = start.headers.get("x-goog-upload-url");
+  if (!start.ok || !uploadUrl) throw new Error(`Gemini file upload start failed (${start.status})`);
+
+  const done = await fetch(uploadUrl, {
+    method: "POST",
+    headers: {
+      "Content-Length": String(buffer.length),
+      "X-Goog-Upload-Offset": "0",
+      "X-Goog-Upload-Command": "upload, finalize",
+    },
+    body: buffer,
+  });
+  if (!done.ok) throw new Error(`Gemini file upload failed (${done.status})`);
+  let file = (await done.json())?.file;
+
+  // Audio files are processed asynchronously — wait until ACTIVE (max ~60s).
+  for (let i = 0; file && file.state === "PROCESSING" && i < 30; i += 1) {
+    await new Promise((r) => setTimeout(r, 2000));
+    const poll = await fetch(`${GEMINI_API_BASE}/v1beta/${file.name}`, { headers: geminiHeaders(apiKey) });
+    if (!poll.ok) break;
+    file = await poll.json();
+  }
+  if (!file?.uri || (file.state && file.state !== "ACTIVE")) {
+    throw new Error(`Gemini file not ready (state: ${file?.state || "unknown"})`);
+  }
+  return { uri: file.uri, mimeType: file.mimeType || mimeType };
+}
+
+/**
+ * Transcribe a call recording with Gemini — replaces the former OpenAI Whisper step
+ * at the same point in the flow (recording_url → transcript text → MoM).
+ */
+async function transcribeRecordingWithGemini(apiKey, recordingUrl, callId) {
+  const audioRes = await fetch(recordingUrl);
+  if (!audioRes.ok) {
+    logger.warn("Could not download call recording for transcription", { callId, status: audioRes.status });
+    return "";
+  }
+  const buffer = Buffer.from(await audioRes.arrayBuffer());
+  const mimeType = audioMimeType(audioRes.headers.get("content-type"), recordingUrl);
+
+  let audioPart;
+  if (buffer.length <= GEMINI_INLINE_AUDIO_MAX_BYTES) {
+    audioPart = { inline_data: { mime_type: mimeType, data: buffer.toString("base64") } };
+  } else {
+    const uploaded = await geminiUploadFile(apiKey, buffer, mimeType, `call-${callId}`);
+    audioPart = { file_data: { mime_type: uploaded.mimeType, file_uri: uploaded.uri } };
+  }
+
+  const result = await geminiGenerateContent(apiKey, {
+    contents: [{
+      role: "user",
+      parts: [
+        audioPart,
+        {
+          text: "Transcribe this sales phone call recording verbatim in its original language(s) (Hindi, English or Hinglish). "
+            + "Label speakers as 'Rep:' and 'Client:' where you can tell them apart. "
+            + "Return ONLY the transcript text — no summary, no commentary. "
+            + "If there is no intelligible speech, return an empty response.",
+        },
+      ],
+    }],
+    generationConfig: { temperature: 0 },
+  });
+
+  if (!result.ok) {
+    logger.warn("Gemini transcription request failed", { callId, status: result.status, error: result.errorText });
+    return "";
+  }
+  return geminiResponseText(result.data);
 }
 
 /** The Service field stores a bare name today, but older leads may carry the
@@ -104,7 +238,7 @@ function flattenSummaryForStorage(rawSummary) {
 }
 
 async function processCallWithAi(tenantId, callId) {
-  const apiKey = process.env.OPENAI_API_KEY;
+  const apiKey = getGeminiApiKey();
 
   // 1. Fetch the call log & associated lead info
   const callRes = await pool.query(
@@ -147,7 +281,7 @@ async function processCallWithAi(tenantId, callId) {
     : (rawOutcome || "Connected");
 
   let transcript = "";
-  let transcriptSource = null; // "existing" | "whisper" | null
+  let transcriptSource = null; // "existing" | "gemini" | null
   let summaryText = NO_RECORDING_MSG;
   let structuredSummary = null;
   let sentiment = "neutral";
@@ -162,9 +296,9 @@ async function processCallWithAi(tenantId, callId) {
 
   if (hasUsableTranscript) {
     // Transcript/words are already on the call record (e.g. supplied by the call source
-    // directly, or entered previously) — use that text for GPT directly. Do NOT require a
-    // recording URL, and do NOT re-run Whisper, when we already have usable transcript text.
-    logger.info("Using existing transcript already present on the call record — skipping Whisper", { callId });
+    // directly, or entered previously) — use that text for Gemini directly. Do NOT require a
+    // recording URL, and do NOT re-transcribe, when we already have usable transcript text.
+    logger.info("Using existing transcript already present on the call record — skipping transcription", { callId });
     transcript = existingTranscript;
     transcriptSource = "existing";
   } else if (isNotConnected || !hasRecording) {
@@ -183,42 +317,18 @@ async function processCallWithAi(tenantId, callId) {
     transcript = "";
     rating = 0;
   } else {
-    // No existing transcript, but a recording URL exists — transcribe with Whisper.
+    // No existing transcript, but a recording URL exists — transcribe with Gemini
+    // (audio → text), then summarize that transcript below exactly as before.
     if (!apiKey) {
-      logger.warn("OPENAI_API_KEY not configured — cannot transcribe recording", { callId });
-      summaryText = OPENAI_NOT_CONFIGURED_MSG;
+      logger.warn("GEMINI_API_KEY not configured — cannot transcribe recording", { callId });
+      summaryText = GEMINI_NOT_CONFIGURED_MSG;
     } else {
       try {
-        logger.info("Downloading audio recording for Whisper transcription", { callId, recordingUrl: call.recording_url });
-        const audioRes = await fetch(call.recording_url);
-        if (audioRes.ok) {
-          const arrayBuffer = await audioRes.arrayBuffer();
-          const buffer = Buffer.from(arrayBuffer);
-
-          const formData = new FormData();
-          const fileBlob = new Blob([buffer], { type: "audio/mp3" });
-          formData.append("file", fileBlob, "recording.mp3");
-          formData.append("model", "whisper-1");
-
-          const whisperRes = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-            method: "POST",
-            headers: { Authorization: `Bearer ${apiKey}` },
-            body: formData,
-          });
-
-          if (whisperRes.ok) {
-            const whisperData = await whisperRes.json();
-            transcript = (whisperData.text || "").trim();
-            if (transcript) transcriptSource = "whisper";
-          } else {
-            const errText = await whisperRes.text().catch(() => "");
-            logger.warn("Whisper transcription request failed", { callId, status: whisperRes.status, error: errText });
-          }
-        } else {
-          logger.warn("Could not download call recording for transcription", { callId, status: audioRes.status });
-        }
+        logger.info("Downloading audio recording for Gemini transcription", { callId, recordingUrl: call.recording_url });
+        transcript = String(await transcribeRecordingWithGemini(apiKey, call.recording_url, callId) || "").trim();
+        if (transcript) transcriptSource = "gemini";
       } catch (err) {
-        logger.warn("Whisper transcription failed for recording", { callId, error: err.message });
+        logger.warn("Gemini transcription failed for recording", { callId, error: err.message });
       }
 
       if (!transcript) {
@@ -227,30 +337,20 @@ async function processCallWithAi(tenantId, callId) {
     }
   }
 
-  // GPT summarization — runs whenever we ended up with usable transcript text, regardless
-  // of whether it came from the call record directly or from Whisper above.
+  // Gemini summarization — runs whenever we ended up with usable transcript text, regardless
+  // of whether it came from the call record directly or from Gemini transcription above.
+  // Same prompt and same JSON output contract as the previous OpenAI call, so the stored
+  // columns and the Lead Details "AI Call Summary & MoM" UI are unchanged.
   if (transcript) {
     if (!apiKey) {
-      logger.warn("OPENAI_API_KEY not configured — cannot generate MoM from transcript", { callId });
-      summaryText = OPENAI_NOT_CONFIGURED_MSG;
+      logger.warn("GEMINI_API_KEY not configured — cannot generate MoM from transcript", { callId });
+      summaryText = GEMINI_NOT_CONFIGURED_MSG;
     } else {
       const transcriptFallbackTag = transcriptSource === "existing" ? "[TRANSCRIPT ON FILE]" : "[REAL AUDIO TRANSCRIPT]";
       try {
         const callAiModel = getCallAiModel();
-        logger.info("Generating MoM from transcript with GPT", { callId, transcriptSource, model: callAiModel });
-        const gptRes = await fetch("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify({
-            model: callAiModel,
-            response_format: { type: "json_object" },
-            messages: [
-              {
-                role: "system",
-                content: `You are an AI sales compliance & MoM generator for TS Publications CRM. Analyze the REAL transcript below for client "${clientName}".
+        logger.info("Generating MoM from transcript with Gemini", { callId, transcriptSource, model: callAiModel });
+        const systemPrompt = `You are an AI sales compliance & MoM generator for TS Publications CRM. Analyze the REAL transcript below for client "${clientName}".
 Generate a structured Minutes of Meeting (MoM) containing ONLY facts discussed in the transcript.
 Do NOT invent or hallucinate facts outside the transcript.
 
@@ -293,28 +393,33 @@ Return JSON with exact keys:
     "KYC Questioning": 55,
     "Objection Handling": 60
   }
-}`,
-              },
-              {
-                role: "user",
-                content: `Real Transcript:\n${transcript}`,
-              },
-            ],
-          }),
+}`;
+        const geminiRes = await geminiGenerateContent(apiKey, {
+          systemInstruction: { parts: [{ text: systemPrompt }] },
+          contents: [{ role: "user", parts: [{ text: `Real Transcript:\n${transcript}` }] }],
+          generationConfig: {
+            // Equivalent of OpenAI response_format: json_object.
+            responseMimeType: "application/json",
+            temperature: 0.2,
+          },
         });
 
-        if (gptRes.ok) {
-          const gptData = await gptRes.json();
-          const content = gptData?.choices?.[0]?.message?.content;
+        if (geminiRes.ok) {
+          const content = geminiResponseText(geminiRes.data);
           if (!content) {
-            logger.error("GPT returned an empty response body", { callId, gptData });
+            logger.error("Gemini returned an empty response body", {
+              callId,
+              finishReason: geminiRes.data?.candidates?.[0]?.finishReason || null,
+              blockReason: geminiRes.data?.promptFeedback?.blockReason || null,
+            });
             summaryText = `${transcriptFallbackTag}\nCall Date: ${dateStr} at ${timeStr}\nDuration: ${durationStr}\n\n${transcript}`;
           } else {
             let analysis;
             try {
-              analysis = JSON.parse(content);
+              // Tolerate a ```json fenced block, just in case.
+              analysis = JSON.parse(content.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, ""));
             } catch (parseErr) {
-              logger.error("GPT returned invalid JSON", { callId, error: parseErr.message, content });
+              logger.error("Gemini returned invalid JSON", { callId, error: parseErr.message, content });
               analysis = null;
             }
             if (!analysis || typeof analysis !== "object") {
@@ -335,12 +440,11 @@ Return JSON with exact keys:
             }
           }
         } else {
-          const errText = await gptRes.text().catch(() => "");
-          logger.error("GPT API request failed", { callId, status: gptRes.status, error: errText });
+          logger.error("Gemini API request failed", { callId, status: geminiRes.status, error: geminiRes.errorText });
           summaryText = `${transcriptFallbackTag}\nCall Date: ${dateStr} at ${timeStr}\nDuration: ${durationStr}\n\n${transcript}`;
         }
       } catch (err) {
-        logger.error("GPT summarization threw an error", { callId, error: err.message });
+        logger.error("Gemini summarization threw an error", { callId, error: err.message });
         summaryText = `${transcriptFallbackTag}\nCall Date: ${dateStr} at ${timeStr}\nDuration: ${durationStr}\n\n${transcript}`;
       }
     }

@@ -3,6 +3,7 @@ const pool = require("../../config/db");
 const { CALL_CONVERSATION_MIN_SEC } = require("../utils/callMetrics");
 const { formatUtcInstantAsAppSql, parseCallyzerCallInstant } = require("../utils/appTimezone");
 const privateContactsRepo = require("../repositories/privateContactsRepo");
+const { toIndianMobile10, toCallyzerNumber } = require("../utils/phone");
 
 const BASE_URL = (process.env.CALLYZER_API_BASE_URL || "https://api1.callyzer.co/api/v2.1").replace(/\/$/, "");
 const MIN_INTERVAL_MS = 2100;
@@ -69,8 +70,14 @@ function digitsOnly(value) {
 }
 
 function normalizePhone(countryCode, number) {
-  const num = digitsOnly(number);
   const cc = digitsOnly(countryCode);
+  // Indian numbers: canonical last-10 digits so an already-prefixed number
+  // ("919876543210" / "+91919876543210") never becomes "91919876543210".
+  const indian = toIndianMobile10(number, cc || null);
+  if (indian && (!cc || cc === "91")) {
+    return { full: `91${indian}`, last10: indian, hyphen: `91-${indian}` };
+  }
+  const num = digitsOnly(number);
   const full = cc && num ? `${cc}${num}` : num;
   return {
     full,
@@ -98,20 +105,16 @@ function employeeEmpNumbers(employee) {
 
   if (callyser) {
     const raw = String(callyser).trim().replace(/^\+/, "");
-    if (raw.includes("-")) {
-      numbers.add(raw);
-    } else {
-      const d = digitsOnly(raw);
-      if (d.length === 10) numbers.add(`91-${d}`);
-      else if (d.length > 10) numbers.add(`${d.slice(0, d.length - 10)}-${d.slice(-10)}`);
-      else numbers.add(raw);
-    }
+    // Indian IDs are always rebuilt as "91-<last 10>" (fixes "9191-…" doubles);
+    // other countries' "CC-number" IDs are kept exactly as entered in Team.
+    const indian = toIndianMobile10(raw.replace(/-/g, ""));
+    if (indian) numbers.add(`91-${indian}`);
+    else numbers.add(raw.includes("-") ? raw : (toCallyzerNumber(raw) || raw));
   }
 
   if (phone) {
-    const d = digitsOnly(phone);
-    if (d.length === 10) numbers.add(`91-${d}`);
-    else if (d.length > 10) numbers.add(`${d.slice(0, d.length - 10)}-${d.slice(-10)}`);
+    const formatted = toCallyzerNumber(phone);
+    if (formatted) numbers.add(formatted);
   }
 
   // NOTE: Do NOT fall back to empCode/emp_id — those are internal DB IDs,
@@ -174,14 +177,13 @@ function mapLogToCall(log, employeeId, leadId) {
 }
 
 function formatLeadContactNumber(phone) {
-  const d = digitsOnly(phone);
-  if (!d) return null;
-  if (d.length === 10) return `91-${d}`;
-  if (d.length > 10) return `${d.slice(0, d.length - 10)}-${d.slice(-10)}`;
-  return null;
+  // Callyzer /lead/capture expects "<country>-<number>": Indian → "91-XXXXXXXXXX".
+  return toCallyzerNumber(phone);
 }
 
 function buildDialUrl(phone) {
+  const indian = toIndianMobile10(phone);
+  if (indian) return `tel:${indian}`;
   let d = digitsOnly(phone);
   if (!d) return null;
 

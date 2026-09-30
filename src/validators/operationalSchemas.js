@@ -107,7 +107,10 @@ const taskSchema = z.object({
 const meetingSchema = z.object({
   leadId: objectId,
   employeeId: objectId,
-  title: z.string().min(1),
+  // Title is generated server-side ("{Customer} {Service} - Clarity Call"); a client
+  // value is accepted for backward compatibility but overridden in the route.
+  title: z.string().optional().nullable(),
+  service: z.string().optional().nullable(),
   scheduledAt: z.coerce.date(),
   durationMin: z.coerce.number().optional(),
   meetLink: z.string().optional().nullable(),

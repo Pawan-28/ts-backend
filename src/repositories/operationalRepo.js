@@ -1450,7 +1450,12 @@ async function updateMeeting(tenantId, meetingId, patch) {
     `UPDATE meetings SET ${fields.join(", ")} WHERE id = $1 AND tenant_id = $2 RETURNING *`,
     params,
   );
-  return mapMeeting(result.rows[0]);
+  if (result.rows[0]) return mapMeeting(result.rows[0]);
+  // MySQL/MariaDB have no UPDATE … RETURNING, and the db.js fallback re-reads by the
+  // LAST bound param (tenant_id here, not id) — so it came back empty even though the
+  // update succeeded, which made reschedule/MoM saves report "Meeting not found".
+  // Re-read the row explicitly (tenant-scoped).
+  return findMeetingById(tenantId, meetingId);
 }
 
 async function listMeetings(tenantId, employeeId, options = {}) {

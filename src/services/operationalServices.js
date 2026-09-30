@@ -1,4 +1,5 @@
 const repo = require("../repositories/operationalRepo");
+const { buildClarityCallTitle, resolveCustomerName } = require("../utils/meetingTitle");
 const { emitTenant, emitEmployee } = require("../realtime/socket");
 const { cacheGet, cacheSet } = require("../config/redis");
 const pool = require("../../config/db");
@@ -311,7 +312,7 @@ async function createLead(input, options = {}) {
             data: {
               leadId: updatedLead.id,
               employeeId: empId,
-              title: input.meetingTitle || input.meeting_title || (serviceName ? `Discovery Meeting: ${serviceName}` : `Lead Meeting - ${updatedLead.leadName}`),
+              title: input.meetingTitle || input.meeting_title || buildClarityCallTitle(resolveCustomerName(updatedLead), serviceName),
               scheduledAt: meetingTime ? new Date(meetingTime) : new Date(Date.now() + 3600 * 1000),
               durationMin: Number(input.durationMin || input.duration_min || 30),
               meetLink: meetLink || null,
@@ -540,7 +541,7 @@ async function createLead(input, options = {}) {
           data: {
             leadId: lead.id,
             employeeId: empId,
-            title: input.meetingTitle || input.meeting_title || (serviceName ? `Discovery Meeting: ${serviceName}` : `Lead Meeting - ${lead.leadName}`),
+            title: input.meetingTitle || input.meeting_title || buildClarityCallTitle(resolveCustomerName(lead), serviceName),
             scheduledAt: meetingTime ? new Date(meetingTime) : new Date(Date.now() + 3600 * 1000),
             durationMin: Number(input.durationMin || input.duration_min || 30),
             meetLink: meetLink || null,
