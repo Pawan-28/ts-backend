@@ -62,15 +62,43 @@ async function geminiGenerateContent(apiKey, body) {
   return { ok: true, status: res.status, data: await res.json(), errorText: "" };
 }
 
-function audioMimeType(contentType, url) {
+/**
+ * Detect the real audio container from the file bytes (Callyzer/S3 often send
+ * "application/octet-stream" or vendor types like "audio/x-m4a", which Gemini rejects).
+ * Returns { format, mimeTypes: [...candidates in preferred order] }.
+ */
+function detectAudioFormat(buffer, contentType, url) {
+  const b = buffer || Buffer.alloc(0);
+  const ascii = (start, len) => b.slice(start, start + len).toString("latin1");
+  if (ascii(0, 4) === "RIFF" && ascii(8, 4) === "WAVE") return { format: "wav", mimeTypes: ["audio/wav"] };
+  if (ascii(0, 4) === "OggS") return { format: "ogg", mimeTypes: ["audio/ogg"] };
+  if (ascii(0, 4) === "fLaC") return { format: "flac", mimeTypes: ["audio/flac"] };
+  if (ascii(0, 5) === "#!AMR") return { format: "amr", mimeTypes: ["audio/amr"] };
+  if (ascii(4, 4) === "ftyp") return { format: "m4a", mimeTypes: ["audio/mp4", "audio/m4a", "audio/aac"] };
+  if (b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3) return { format: "webm", mimeTypes: ["audio/webm"] };
+  if (ascii(0, 3) === "ID3" || (b[0] === 0xff && (b[1] & 0xe0) === 0xe0 && (b[1] & 0x06) !== 0)) {
+    return { format: "mp3", mimeTypes: ["audio/mp3", "audio/mpeg"] };
+  }
+  if (b[0] === 0xff && (b[1] & 0xf6) === 0xf0) return { format: "aac", mimeTypes: ["audio/aac"] };
+
+  // Unknown bytes — fall back to header / extension.
   const ct = String(contentType || "").split(";")[0].trim().toLowerCase();
-  if (ct.startsWith("audio/")) return ct === "audio/mp3" ? "audio/mpeg" : ct;
   const ext = String(url || "").split("?")[0].split(".").pop().toLowerCase();
-  const byExt = {
-    mp3: "audio/mpeg", wav: "audio/wav", m4a: "audio/mp4", mp4: "audio/mp4", aac: "audio/aac",
-    ogg: "audio/ogg", amr: "audio/amr", flac: "audio/flac", webm: "audio/webm", "3gp": "audio/3gpp",
+  const byKey = {
+    mp3: ["audio/mp3", "audio/mpeg"], mpeg: ["audio/mp3", "audio/mpeg"], wav: ["audio/wav"], "x-wav": ["audio/wav"],
+    m4a: ["audio/mp4", "audio/m4a", "audio/aac"], "x-m4a": ["audio/mp4", "audio/m4a", "audio/aac"], mp4: ["audio/mp4", "audio/aac"],
+    aac: ["audio/aac"], ogg: ["audio/ogg"], flac: ["audio/flac"], amr: ["audio/amr"], webm: ["audio/webm"], "3gp": ["audio/3gpp"],
   };
-  return byExt[ext] || "audio/mpeg";
+  const fromCt = ct.startsWith("audio/") ? byKey[ct.slice(6)] : null;
+  return { format: ext || ct || "unknown", mimeTypes: fromCt || byKey[ext] || ["audio/mp3", "audio/mpeg"] };
+}
+
+/** Short, key-free reason from a Gemini error body (shown on the call so failures are diagnosable). */
+function geminiErrorReason(status, errorText) {
+  let msg = "";
+  try { msg = JSON.parse(errorText)?.error?.message || ""; } catch { msg = String(errorText || ""); }
+  msg = msg.replace(/key=[^&\s]+/gi, "key=***").replace(/AIza[0-9A-Za-z_-]{20,}/g, "***").slice(0, 200);
+  return `Gemini ${status}${msg ? `: ${msg}` : ""}`;
 }
 
 /** Upload a large recording through the Gemini Files API; returns { uri, mimeType }. */
@@ -122,40 +150,63 @@ async function transcribeRecordingWithGemini(apiKey, recordingUrl, callId) {
   const audioRes = await fetch(recordingUrl);
   if (!audioRes.ok) {
     logger.warn("Could not download call recording for transcription", { callId, status: audioRes.status });
-    return "";
+    return { text: "", reason: `recording download failed (HTTP ${audioRes.status})` };
   }
   const buffer = Buffer.from(await audioRes.arrayBuffer());
-  const mimeType = audioMimeType(audioRes.headers.get("content-type"), recordingUrl);
+  if (!buffer.length) return { text: "", reason: "recording file is empty" };
+  const { format, mimeTypes } = detectAudioFormat(buffer, audioRes.headers.get("content-type"), recordingUrl);
 
-  let audioPart;
-  if (buffer.length <= GEMINI_INLINE_AUDIO_MAX_BYTES) {
-    audioPart = { inline_data: { mime_type: mimeType, data: buffer.toString("base64") } };
-  } else {
-    const uploaded = await geminiUploadFile(apiKey, buffer, mimeType, `call-${callId}`);
-    audioPart = { file_data: { mime_type: uploaded.mimeType, file_uri: uploaded.uri } };
+  const prompt = {
+    text: "Transcribe this sales phone call recording verbatim in its original language(s) (Hindi, English or Hinglish). "
+      + "Label speakers as 'Rep:' and 'Client:' where you can tell them apart. "
+      + "Return ONLY the transcript text — no summary, no commentary. "
+      + "If there is no intelligible speech, return an empty response.",
+  };
+
+  let lastReason = "";
+  // Try each candidate MIME type; if Gemini rejects inline audio for a format, retry
+  // the same format through the Files API before giving up.
+  for (const mimeType of mimeTypes) {
+    const attempts = buffer.length <= GEMINI_INLINE_AUDIO_MAX_BYTES ? ["inline", "file"] : ["file"];
+    for (const mode of attempts) {
+      let audioPart;
+      try {
+        if (mode === "inline") {
+          audioPart = { inline_data: { mime_type: mimeType, data: buffer.toString("base64") } };
+        } else {
+          const uploaded = await geminiUploadFile(apiKey, buffer, mimeType, `call-${callId}`);
+          audioPart = { file_data: { mime_type: uploaded.mimeType, file_uri: uploaded.uri } };
+        }
+      } catch (err) {
+        lastReason = `Gemini file upload failed (${err.message})`;
+        continue;
+      }
+
+      const result = await geminiGenerateContent(apiKey, {
+        contents: [{ role: "user", parts: [audioPart, prompt] }],
+        generationConfig: { temperature: 0 },
+      });
+
+      if (result.ok) {
+        const text = geminiResponseText(result.data);
+        if (text) return { text, reason: "" };
+        const finish = result.data?.candidates?.[0]?.finishReason;
+        const blocked = result.data?.promptFeedback?.blockReason;
+        return {
+          text: "",
+          reason: blocked ? `Gemini blocked the audio (${blocked})` : `no speech detected in the recording${finish && finish !== "STOP" ? ` (finish: ${finish})` : ""}`,
+        };
+      }
+
+      lastReason = geminiErrorReason(result.status, result.errorText);
+      logger.warn("Gemini transcription request failed", { callId, status: result.status, format, mimeType, mode, error: lastReason });
+      // Auth / quota / model errors won't be fixed by another MIME type — stop early.
+      if ([401, 403, 404, 429].includes(result.status) || result.status >= 500) {
+        return { text: "", reason: lastReason };
+      }
+    }
   }
-
-  const result = await geminiGenerateContent(apiKey, {
-    contents: [{
-      role: "user",
-      parts: [
-        audioPart,
-        {
-          text: "Transcribe this sales phone call recording verbatim in its original language(s) (Hindi, English or Hinglish). "
-            + "Label speakers as 'Rep:' and 'Client:' where you can tell them apart. "
-            + "Return ONLY the transcript text — no summary, no commentary. "
-            + "If there is no intelligible speech, return an empty response.",
-        },
-      ],
-    }],
-    generationConfig: { temperature: 0 },
-  });
-
-  if (!result.ok) {
-    logger.warn("Gemini transcription request failed", { callId, status: result.status, error: result.errorText });
-    return "";
-  }
-  return geminiResponseText(result.data);
+  return { text: "", reason: `${lastReason || "Gemini could not read the audio"} [format: ${format}]` };
 }
 
 /** The Service field stores a bare name today, but older leads may carry the
@@ -283,6 +334,7 @@ async function processCallWithAi(tenantId, callId) {
 
   let transcript = "";
   let transcriptSource = null; // "existing" | "gemini" | null
+  let transcriptFailReason = "";
   let summaryText = NO_RECORDING_MSG;
   let structuredSummary = null;
   let sentiment = "neutral";
@@ -326,14 +378,27 @@ async function processCallWithAi(tenantId, callId) {
     } else {
       try {
         logger.info("Downloading audio recording for Gemini transcription", { callId, recordingUrl: call.recording_url });
-        transcript = String(await transcribeRecordingWithGemini(apiKey, call.recording_url, callId) || "").trim();
+        const tr = await transcribeRecordingWithGemini(apiKey, call.recording_url, callId);
+        transcript = String(tr?.text || "").trim();
+        transcriptFailReason = tr?.reason || "";
         if (transcript) transcriptSource = "gemini";
       } catch (err) {
+        transcriptFailReason = err.message;
         logger.warn("Gemini transcription failed for recording", { callId, error: err.message });
       }
 
       if (!transcript) {
-        summaryText = TRANSCRIPT_UNAVAILABLE_MSG;
+        // Keep the [TRANSCRIPT UNAVAILABLE] marker (background retry relies on it) and
+        // append the concrete reason so the failure is visible on the call.
+        if (/^no speech detected/i.test(transcriptFailReason)) {
+          // Genuinely silent/unintelligible audio — not an error, so no retry marker
+          // (avoids re-sending the same silent recording to Gemini on every sync).
+          summaryText = `[NO SPEECH DETECTED]\nCall Date: ${dateStr} at ${timeStr}\nDuration: ${durationStr}\n\nThe recording was processed but contained no intelligible conversation, so no MoM was generated.`;
+        } else {
+          summaryText = transcriptFailReason
+            ? `${TRANSCRIPT_UNAVAILABLE_MSG}\nReason: ${transcriptFailReason}`
+            : TRANSCRIPT_UNAVAILABLE_MSG;
+        }
       }
     }
   }

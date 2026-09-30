@@ -591,12 +591,32 @@ async function updateLead(tenantId, leadId, patch) {
 
   if (!fields.length) return findLeadById(tenantId, leadId);
 
+  // Converted / Advanced Paid → n8n: remember the previous stage/status so the webhook
+  // only fires on a real transition (see services/leadStatusWebhookService.js).
+  const touchesStatus = patch.pipelineStage !== undefined || patch.status !== undefined;
+  let beforeStatus = null;
+  if (touchesStatus) {
+    const prev = await pool.query(
+      "SELECT pipeline_stage, status FROM leads WHERE tenant_id = $1 AND id = $2 LIMIT 1",
+      [tenantId, leadId],
+    );
+    beforeStatus = prev.rows[0] || null;
+  }
+
   fields.push("updated_at = NOW()");
   const result = await pool.query(
     `UPDATE leads SET ${fields.join(", ")} WHERE tenant_id = $1 AND id = $2 AND is_deleted = 0 RETURNING *`,
     params,
   );
-  return mapLead(result.rows[0]);
+  const updatedLead = mapLead(result.rows[0]);
+
+  // Only after the DB update succeeded (updated row came back).
+  if (touchesStatus && updatedLead && beforeStatus) {
+    require("../services/leadStatusWebhookService").notifyLeadStatusUpdated({
+      tenantId, leadId: updatedLead.id, before: beforeStatus,
+    });
+  }
+  return updatedLead;
 }
 
 async function softDeleteLead(tenantId, leadId) {

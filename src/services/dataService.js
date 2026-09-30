@@ -991,11 +991,19 @@ async function getPipelineLeads(tenantId = TENANT) {
 async function updatePipelineLeadStage(leadId, stage, tenantId = TENANT) {
   const dbStage = ADMIN_PIPELINE_TO_DB_STAGE[stage] || normalizeStageLabel(stage);
 
+  const prev = await pool.query(
+    "SELECT pipeline_stage, status FROM leads WHERE id = $1 AND tenant_id = $2 LIMIT 1",
+    [leadId, tenantId],
+  );
   await pool.query(
     `UPDATE leads SET pipeline_stage = $1, status = $1, updated_at = NOW(), last_activity_at = NOW()
      WHERE id = $2 AND tenant_id = $3`,
     [dbStage, leadId, tenantId],
   );
+  // Converted / Advanced Paid → n8n (after the successful update; never blocks/rolls back).
+  if (prev.rows[0]) {
+    require("./leadStatusWebhookService").notifyLeadStatusUpdated({ tenantId, leadId, before: prev.rows[0] });
+  }
   return { success: true };
 }
 

@@ -252,6 +252,11 @@ const updateLead = async (req, res) => {
       temperature, pipeline_stage, status, expected_revenue,
     } = req.body;
 
+    const prevStatus = await pool.query(
+      "SELECT pipeline_stage, status, tenant_id FROM leads WHERE id = $1 LIMIT 1",
+      [id],
+    );
+
     const result = await pool.query(
       `UPDATE leads SET
         lead_name=$1, phone=$2, email=$3, city=$4, company_name=$5,
@@ -277,6 +282,15 @@ const updateLead = async (req, res) => {
       return res.status(404).json({ success: false, message: "Lead not found" });
 
     const lead = result.rows[0];
+
+    // Converted / Advanced Paid → n8n (after the successful update; never blocks/rolls back).
+    if (prevStatus.rows[0]) {
+      require("../services/leadStatusWebhookService").notifyLeadStatusUpdated({
+        tenantId: prevStatus.rows[0].tenant_id || "default",
+        leadId: Number(id),
+        before: prevStatus.rows[0],
+      });
+    }
 
     await logActivity({
       action: `Updated lead: ${lead.company_name || lead.lead_name}`,
