@@ -973,10 +973,13 @@ const getEmployeeCallyzerStats = async (req, res) => {
     const month = req.query.month;
     const period = String(req.query.period || "month").toLowerCase();
 
+    // CALL_STATS_AGG_SQL references columns as `ec.<col>`, so the table MUST be
+    // aliased `ec` here (same as queryCallStats / teamKpiMetrics). Without the alias
+    // MySQL fails with "Unknown column 'ec.duration_sec'".
     const periodFilter = buildPeriodDateFilter({
       period: month ? "month" : period,
       month,
-      column: "COALESCE(started_at, created_at)",
+      column: "COALESCE(ec.started_at, ec.created_at)",
       paramOffset: 3,
     });
 
@@ -985,8 +988,8 @@ const getEmployeeCallyzerStats = async (req, res) => {
     const [statsResult, empResult] = await Promise.all([
       pool.query(
         `SELECT ${CALL_STATS_AGG_SQL}
-         FROM employee_calls
-         WHERE tenant_id = $1 AND employee_id = $2 AND ${periodFilter.clause}`,
+         FROM employee_calls ec
+         WHERE ec.tenant_id = $1 AND ec.employee_id = $2 AND ${periodFilter.clause}`,
         params,
       ),
       pool.query(

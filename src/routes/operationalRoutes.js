@@ -26,6 +26,8 @@ const {
 } = require("../validators/operationalSchemas");
 const pool = require("../../config/db");
 const { queryCallStats } = require("../utils/employeeCallStats");
+const { isValidDateKey } = require("../utils/periodFilter");
+const { isDateKeyInPeriod, localDateKey: periodLocalDateKey } = require("../utils/periodDateKeys");
 const { requirePg } = require("../middleware/pgReady");
 const {
   isAdminUser,
@@ -851,9 +853,30 @@ router.get("/pipeline/board", asyncRoute(async (req, res) => {
 
 router.get("/employee/:employeeId/pipeline/board", requireEmployeeSelf(), asyncRoute(async (req, res) => {
   const tenantId = tenant(req);
+  // requireEmployeeSelf() above guarantees an employee can only load their OWN board;
+  // every query below is additionally scoped by this employeeId.
   const employeeId = req.params.employeeId;
   const period = String(req.query.period || "month").toLowerCase();
   const limit = Number(req.query.limit) || 5000;
+
+  // Same query contract as the Admin Dashboard (lib/periodQuery.js):
+  // period=today|week|month|custom [&startDate=YYYY-MM-DD&endDate=YYYY-MM-DD]
+  const ALLOWED_PERIODS = new Set(["today", "day", "week", "month", "custom", "all"]);
+  if (!ALLOWED_PERIODS.has(period)) {
+    return res.status(400).json({ success: false, message: `Invalid period "${period}"` });
+  }
+  let startDate = null;
+  let endDate = null;
+  if (period === "custom") {
+    startDate = String(req.query.startDate || "");
+    endDate = String(req.query.endDate || "");
+    if (!isValidDateKey(startDate) || !isValidDateKey(endDate)) {
+      return res.status(400).json({ success: false, message: "Custom range needs startDate and endDate as YYYY-MM-DD" });
+    }
+    if (startDate > endDate) {
+      return res.status(400).json({ success: false, message: "From Date must be on or before To Date" });
+    }
+  }
 
   const employee = await repo.findEmployeeById(tenantId, employeeId);
   let employeeLeads = [];
@@ -880,8 +903,32 @@ router.get("/employee/:employeeId/pipeline/board", requireEmployeeSelf(), asyncR
     employeeId,
     limit,
     attachLeads: employeeLeads,
+    startDate,
+    endDate,
   });
-  return ok(res, payload, { syncedAt: new Date().toISOString() });
+
+  // Meetings: return only those scheduled inside the selected period (same rule
+  // the frontend board applies — filterMeetingsForPeriod), so the API response
+  // itself reflects the date filter.
+  if (period !== "all" && Array.isArray(payload.meetings)) {
+    const customRange = period === "custom" ? { startDate, endDate } : null;
+    payload.meetings = payload.meetings.filter((m) => {
+      if (m.status === "cancelled") return false;
+      const raw = m.scheduledAt || m.date;
+      if (!raw) return period === "month";
+      const rawStr = String(raw);
+      // "YYYY-MM-DD HH:mm:ss" rows are already IST wall-clock (toLocalSqlString).
+      const key = /^\d{4}-\d{2}-\d{2} /.test(rawStr) ? rawStr.slice(0, 10) : periodLocalDateKey(new Date(rawStr));
+      return isDateKeyInPeriod(key, period, new Date(), customRange);
+    });
+    payload.totals = { ...(payload.totals || {}), meetings: payload.meetings.length };
+  }
+
+  return ok(res, payload, {
+    syncedAt: new Date().toISOString(),
+    period,
+    ...(period === "custom" ? { startDate, endDate } : {}),
+  });
 }));
 
 router.get("/calls", asyncRoute(async (req, res) => {

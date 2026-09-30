@@ -112,16 +112,22 @@ async function buildPipelineBoardPayload(tenantId, {
     ? { startDate, endDate }
     : null;
 
-  const callPeriod = periodKey === "custom" ? "month" : periodKey;
+  // Employee-scoped custom ranges are queried with the exact inclusive From–To
+  // range in SQL (so ranges outside the current month work). Tenant-wide custom
+  // keeps the previous behaviour (month fetch + in-memory range filter below).
+  const employeeCustom = customRange && employeeId != null;
+  const callPeriod = periodKey === "custom" && !employeeCustom ? "month" : periodKey;
+  const rangeOpts = employeeCustom ? { startDate: customRange.startDate, endDate: customRange.endDate } : {};
 
   const [stats, dbCalls, meetings, assignedNewLeads] = await Promise.all([
     queryCallStats(pool, {
       tenantId,
       period: callPeriod,
       employeeId: employeeId ?? undefined,
+      ...rangeOpts,
     }),
     employeeId != null
-      ? repo.listCalls(tenantId, employeeId, { period: callPeriod, limit: callLimit })
+      ? repo.listCalls(tenantId, employeeId, { period: callPeriod, limit: callLimit, ...rangeOpts })
       : repo.listTenantCalls(tenantId, { period: callPeriod, limit: callLimit }),
     employeeId != null
       ? repo.listMeetings(tenantId, employeeId, { limit: 1000 })

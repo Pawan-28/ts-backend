@@ -1,5 +1,5 @@
 const { CALL_CONVERSATION_MIN_SEC, CALL_CONVERSATION_LABEL } = require("./callMetrics");
-const { buildPeriodDateFilter } = require("./periodFilter");
+const { buildPeriodDateFilter, buildPeriodOrCustomDateFilter } = require("./periodFilter");
 
 function formatDurationHms(seconds) {
   const s = Number(seconds) || 0;
@@ -73,10 +73,14 @@ function callStatsAggSql(prefix = "ec") {
 
 const CALL_STATS_AGG_SQL = callStatsAggSql("ec");
 
-async function queryCallStats(poolConn, { tenantId, employeeId = null, period = "month", month = null }) {
-  const filter = buildPeriodDateFilter({
+async function queryCallStats(poolConn, {
+  tenantId, employeeId = null, period = "month", month = null, startDate = null, endDate = null,
+}) {
+  const filter = buildPeriodOrCustomDateFilter({
     period: month ? "month" : period,
     month,
+    startDate,
+    endDate,
     column: "COALESCE(ec.started_at, ec.created_at)",
     paramOffset: employeeId != null ? 3 : 2,
   });

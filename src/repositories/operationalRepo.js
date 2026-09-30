@@ -1,5 +1,5 @@
 const pool = require("../../config/db");
-const { buildPeriodDateFilter } = require("../utils/periodFilter");
+const { buildPeriodDateFilter, buildPeriodOrCustomDateFilter } = require("../utils/periodFilter");
 const { toLocalSqlString } = require("../utils/appTimezone");
 
 const DEFAULT_TENANT_ID = "default";
@@ -1120,8 +1120,11 @@ async function listCalls(tenantId, employeeId, options = {}) {
   let periodSql = "";
 
   if (period && period !== "all") {
-    const filter = buildPeriodDateFilter({
+    // period "custom" + options.startDate/endDate → inclusive From–To range.
+    const filter = buildPeriodOrCustomDateFilter({
       period,
+      startDate: options.startDate || null,
+      endDate: options.endDate || null,
       column: "COALESCE(ec.started_at, ec.created_at)",
       paramOffset: 3,
     });

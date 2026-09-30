@@ -99,6 +99,32 @@ function buildCustomDateFilter({
   };
 }
 
+/** Strict YYYY-MM-DD check (used to validate custom range query params). */
+function isValidDateKey(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ""))) return false;
+  const d = new Date(`${value}T00:00:00Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === value;
+}
+
+/**
+ * Today / Week / Month via buildPeriodDateFilter, or an inclusive custom
+ * From–To range via buildCustomDateFilter when period === "custom".
+ */
+function buildPeriodOrCustomDateFilter({
+  period = "month",
+  month = null,
+  startDate = null,
+  endDate = null,
+  column = "COALESCE(started_at, created_at)",
+  paramOffset = 3,
+} = {}) {
+  const p = String(period || "month").toLowerCase();
+  if (p === "custom" && isValidDateKey(startDate) && isValidDateKey(endDate)) {
+    return buildCustomDateFilter({ startDate, endDate, column, paramOffset });
+  }
+  return buildPeriodDateFilter({ period: p === "custom" ? "month" : p, month, column, paramOffset });
+}
+
 /** Previous period of equal length (day / week / month / custom). */
 function buildPreviousPeriodDateFilter({
   period = "month",
@@ -165,6 +191,8 @@ function buildPreviousPeriodDateFilter({
 module.exports = {
   buildPeriodDateFilter,
   buildCustomDateFilter,
+  buildPeriodOrCustomDateFilter,
+  isValidDateKey,
   buildPreviousPeriodDateFilter,
   rangeQueryToPeriod,
   comparisonLabelForPeriod,
