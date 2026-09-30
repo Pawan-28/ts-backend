@@ -4,7 +4,13 @@ const { logger } = require("../config/logger");
 // AI Call Summary & MoM now runs on Google Gemini (was OpenAI Whisper + gpt-4o-mini).
 // Key comes from the server environment only (GEMINI_API_KEY) — never sent to the
 // frontend and never logged. The model can be overridden with GEMINI_CALL_MODEL.
-const DEFAULT_CALL_AI_MODEL = "gemini-2.5-flash";
+// No fixed default model: the model is picked at runtime from the models this API key
+// can actually use (GET /v1beta/models), so a retired/unavailable model never breaks
+// the MoM again. GEMINI_CALL_MODEL (server env) still forces a specific model.
+// gemini-2.5-flash is deliberately excluded from auto-selection (unavailable on this account).
+const EXCLUDED_AUTO_MODELS = new Set(["gemini-2.5-flash"]);
+const MODEL_LIST_TTL_MS = 6 * 60 * 60 * 1000;
+let modelCache = { at: 0, candidates: [], working: null };
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com";
 // Inline audio must keep the whole request under ~20 MB; larger recordings go
 // through the Gemini Files API instead.
@@ -28,7 +34,87 @@ const SECTION_LABELS = {
 };
 
 function getCallAiModel() {
-  return (process.env.GEMINI_CALL_MODEL || DEFAULT_CALL_AI_MODEL).trim();
+  return (process.env.GEMINI_CALL_MODEL || "").trim() || modelCache.working || "(auto)";
+}
+
+/** Parse "gemini-3.1-flash-001" → { major: 3, minor: 1 } for newest-first ordering. */
+function modelVersion(name) {
+  const m = String(name).match(/gemini-(\d+)(?:\.(\d+))?/);
+  return m ? { major: Number(m[1]), minor: Number(m[2] || 0) } : { major: 0, minor: 0 };
+}
+
+/** Rank a model id: lower = preferred. Flash (fast, audio-capable) first, then Pro, then Flash-Lite. */
+function modelRank(name) {
+  const n = String(name);
+  if (n === "gemini-flash-latest") return 0;
+  if (n === "gemini-pro-latest") return 20;
+  const isPreview = /-(preview|exp)/.test(n) ? 1 : 0;
+  const base = n.replace(/-(preview|exp)[\w.-]*$/, "").replace(/-\d{3}$/, "");
+  if (/-flash-lite$/.test(base)) return 40 + isPreview;
+  if (/-flash$/.test(base)) return 10 + isPreview;
+  if (/-pro$/.test(base)) return 30 + isPreview;
+  return 90;
+}
+
+/**
+ * Candidate models for this API key, best first: models that support generateContent,
+ * excluding TTS / image / live / embedding / thinking-only variants and gemini-2.5-flash.
+ */
+async function listCandidateModels(apiKey, { refresh = false } = {}) {
+  const forced = (process.env.GEMINI_CALL_MODEL || "").trim();
+  if (forced) return [forced];
+  if (!refresh && modelCache.candidates.length && Date.now() - modelCache.at < MODEL_LIST_TTL_MS) {
+    return modelCache.working
+      ? [modelCache.working, ...modelCache.candidates.filter((m) => m !== modelCache.working)]
+      : modelCache.candidates;
+  }
+  const names = [];
+  let pageToken = "";
+  for (let page = 0; page < 5; page += 1) {
+    const url = `${GEMINI_API_BASE}/v1beta/models?pageSize=200${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ""}`;
+    const res = await fetch(url, { headers: geminiHeaders(apiKey) });
+    if (!res.ok) {
+      const errorText = await res.text().catch(() => "");
+      const err = new Error(geminiErrorReason(res.status, errorText));
+      err.status = res.status;
+      throw err;
+    }
+    const data = await res.json();
+    for (const m of data.models || []) {
+      const id = String(m.name || "").replace(/^models\//, "");
+      const methods = m.supportedGenerationMethods || [];
+      if (!id.startsWith("gemini-") || !methods.includes("generateContent")) continue;
+      if (/tts|image|live|embedding|audio-dialog|native-audio|computer-use|robotics|learnlm|aqa/i.test(id)) continue;
+      if (EXCLUDED_AUTO_MODELS.has(id)) continue;
+      names.push(id);
+    }
+    pageToken = data.nextPageToken || "";
+    if (!pageToken) break;
+  }
+  const candidates = [...new Set(names)]
+    .filter((n) => modelRank(n) < 90)
+    .sort((a, b) => {
+      const ra = modelRank(a);
+      const rb = modelRank(b);
+      if (Math.floor(ra / 10) !== Math.floor(rb / 10)) return ra - rb;
+      const va = modelVersion(a);
+      const vb = modelVersion(b);
+      if (vb.major !== va.major) return vb.major - va.major;
+      if (vb.minor !== va.minor) return vb.minor - va.minor;
+      return ra - rb;
+    });
+  modelCache = { at: Date.now(), candidates, working: candidates.includes(modelCache.working) ? modelCache.working : null };
+  logger.info("Gemini models available for call MoM", { candidates: candidates.slice(0, 6) });
+  return modelCache.working ? [modelCache.working, ...candidates.filter((m) => m !== modelCache.working)] : candidates;
+}
+
+/** Errors that mean "this model can't be used" → try the next available model. */
+function isModelUnavailableError(status, errorText) {
+  if (status === 404) return true;
+  const t = String(errorText || "").toLowerCase();
+  return (status === 400 || status === 403)
+    && /(not found|not supported|no longer available|is not available|deprecated|unsupported model|does not exist|not have access)/.test(t)
+    && !/mime|api key/.test(t);
 }
 
 function getGeminiApiKey() {
@@ -47,19 +133,41 @@ function geminiResponseText(data) {
   return parts.map((p) => (typeof p?.text === "string" ? p.text : "")).join("").trim();
 }
 
-/** POST models/{model}:generateContent — returns { ok, status, data, errorText }. */
+/**
+ * POST models/{model}:generateContent on the best model available to this key —
+ * returns { ok, status, data, errorText, model }. If a model turns out to be
+ * unavailable, the next candidate is tried automatically and remembered.
+ */
 async function geminiGenerateContent(apiKey, body) {
-  const model = getCallAiModel();
-  const res = await fetch(`${GEMINI_API_BASE}/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-    method: "POST",
-    headers: geminiHeaders(apiKey, { "Content-Type": "application/json" }),
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const errorText = await res.text().catch(() => "");
-    return { ok: false, status: res.status, data: null, errorText: errorText.slice(0, 1000) };
+  let candidates;
+  try {
+    candidates = await listCandidateModels(apiKey);
+  } catch (err) {
+    return { ok: false, status: err.status || 500, data: null, errorText: JSON.stringify({ error: { message: `could not list Gemini models — ${err.message}` } }), model: null };
   }
-  return { ok: true, status: res.status, data: await res.json(), errorText: "" };
+  if (!candidates.length) {
+    return { ok: false, status: 404, data: null, errorText: JSON.stringify({ error: { message: "no Gemini text/audio model is available for this API key" } }), model: null };
+  }
+
+  let last = null;
+  for (const model of candidates.slice(0, 6)) {
+    const res = await fetch(`${GEMINI_API_BASE}/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+      method: "POST",
+      headers: geminiHeaders(apiKey, { "Content-Type": "application/json" }),
+      body: JSON.stringify(body),
+    });
+    if (res.ok) {
+      if (!(process.env.GEMINI_CALL_MODEL || "").trim()) modelCache.working = model;
+      return { ok: true, status: res.status, data: await res.json(), errorText: "", model };
+    }
+    const errorText = (await res.text().catch(() => "")).slice(0, 1000);
+    last = { ok: false, status: res.status, data: null, errorText, model };
+    if (!isModelUnavailableError(res.status, errorText)) return last;
+    logger.warn("Gemini model unavailable — trying next available model", { model, status: res.status });
+    if (modelCache.working === model) modelCache.working = null;
+    modelCache.candidates = modelCache.candidates.filter((m) => m !== model);
+  }
+  return last;
 }
 
 /**
@@ -417,25 +525,37 @@ async function processCallWithAi(tenantId, callId) {
       // background retry pick it up again.
       const aiPendingSummary = `${AI_SUMMARY_PENDING_TAG}\nCall Date: ${dateStr} at ${timeStr}\nDuration: ${durationStr}\n\nThe AI summary for this call could not be generated yet. Click "Re-process AI MoM" to try again.`;
       try {
-        const callAiModel = getCallAiModel();
-        logger.info("Generating MoM from transcript with Gemini", { callId, transcriptSource, model: callAiModel });
+        logger.info("Generating MoM from transcript with Gemini", { callId, transcriptSource, model: getCallAiModel() });
         const systemPrompt = `You are an AI sales compliance & MoM generator for TS Publications CRM. Analyze the REAL transcript below for client "${clientName}".
-Generate a structured Minutes of Meeting (MoM) containing ONLY facts discussed in the transcript.
-LANGUAGE: The transcript may be in Hindi, Hinglish or English. Write EVERY text value in your JSON output (all summary sections, checklist notes) in clear, professional ENGLISH — translate anything said in Hindi/Hinglish. Never use Devanagari script. Keep names, amounts (e.g. ₹45,000 + 18% GST) and numbers exactly as stated.
-Do NOT invent or hallucinate facts outside the transcript.
+Generate a detailed, structured, professional Minutes of Meeting (MoM) containing ONLY facts discussed in the transcript.
+Do NOT invent or hallucinate facts outside the transcript. If something was not discussed, write "Not discussed on the call" instead of guessing.
+
+LANGUAGE:
+- The conversation (and transcript) is usually in HINDI or HINGLISH — the client does not need to speak English. Understand it fully in the original language.
+- Write ALL MoM output (every "summary" section and every checklist "note") in clear, professional ENGLISH. Translate and summarize the meaning of what was said; never output Hindi/Devanagari text and never paste raw transcript lines.
+- Preserve every important detail exactly: names, company/brand/service names, amounts and pricing (e.g. "₹45,000 + 18% GST"), quantities (e.g. "13-14 newspapers"), dates, times, deadlines, commitments and follow-ups.
 
 ${sopGuidance.text}
 
 Generate:
-1. "summary": a JSON OBJECT (not a single string) with EXACTLY these four keys, each a string:
-   - "callHeader": one line covering Date: ${dateStr}, Time: ${timeStr}, Client: ${clientName}, Duration: ${durationStr}${sopGuidance.label ? `, SOP Guidance Used: ${sopGuidance.label}` : ""}
-   - "discussionHighlights": Discussion Highlights & Key Requirements from the call
-   - "qualificationsMet": go through the SOP's qualification checklist above (if any) and state which items were actually covered on the call and which were missed — quote or paraphrase where each was addressed
-   - "actionItems": Action Items & Next Steps
+1. "summary": a JSON OBJECT (not a single string) with EXACTLY these four keys, each a detailed multi-line string in English. Use the sub-headings shown, with bullet points ("• ") under each; include every relevant detail from the call (requirements, prices quoted, packages, timelines, platforms, decision-maker info, etc.):
+   - "callHeader":
+       first line: Date: ${dateStr} | Time: ${timeStr} | Client: ${clientName} | Duration: ${durationStr}${sopGuidance.label ? ` | SOP: ${sopGuidance.label}` : ""}
+       then "Call Summary:" — 3-5 lines describing the purpose of the call, what happened and the overall outcome.
+   - "discussionHighlights":
+       "Key Discussion Points:" — every important topic discussed, in order;
+       "Customer Requirements:" — what the client needs/asked for (service, budget, timeline, platform, quantity);
+       "Customer Concerns / Objections:" — doubts, objections or hesitations and how the rep responded (write "No objections raised" if none).
+   - "qualificationsMet":
+       "SOP Evaluation:" — go through the SOP qualification checklist above (if any) and state which items were covered and which were missed, quoting/paraphrasing where each was addressed;
+       "Rep Performance:" — 2-3 lines on the rep's strengths and what to improve on this call.
+   - "actionItems":
+       "Next Steps:" — agreed next steps with dates/times if mentioned;
+       "Action Items:" — numbered tasks, each with the owner (Rep / Client) and deadline if stated.
 2. "sentiment": "positive" | "neutral" | "negative"
 3. "rating": integer 1-5
 4. "temperature": "Hot Lead" | "Warm Lead" | "Cold Lead"
-5. "checklistProgress": for EACH item in the SOP qualification checklist above, an object { "question": <the checklist item text>, "covered": true|false, "note": "<one line on what was said, or empty if not covered>" }. Return an empty array if no checklist was provided.
+5. "checklistProgress": for EACH item in the SOP qualification checklist above, an object { "question": <the checklist item text exactly as given>, "covered": true|false, "note": "<one line in English on what was said, or empty if not covered>" }. Return an empty array if no checklist was provided.
 6. "competencyScores": score the rep 0-100 on each of these five fixed dimensions, judged against the SOP script/frameworks/checklist above where provided:
    - "Product Value Alignment": how well the rep tied the product/service to the client's stated needs
    - "Call Control": did the rep guide the conversation and the agenda rather than being led
