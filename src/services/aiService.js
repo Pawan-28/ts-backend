@@ -201,6 +201,52 @@ function detectAudioFormat(buffer, contentType, url) {
   return { format: ext || ct || "unknown", mimeTypes: fromCt || byKey[ext] || ["audio/mp3", "audio/mpeg"] };
 }
 
+// ── Gemini charges (estimate from the API's usageMetadata) ─────────────────────────
+// USD per 1M tokens. Defaults = Google's published paid-tier Gemini Flash rates; set the
+// env vars to your account's actual rates. Thinking tokens are billed as output.
+function geminiRates() {
+  const num = (v, d) => (Number.isFinite(Number(v)) && String(v).trim() !== "" ? Number(v) : d);
+  return {
+    textIn: num(process.env.GEMINI_PRICE_TEXT_INPUT_PER_M, 0.30),
+    audioIn: num(process.env.GEMINI_PRICE_AUDIO_INPUT_PER_M, 1.00),
+    out: num(process.env.GEMINI_PRICE_OUTPUT_PER_M, 2.50),
+    usdInr: num(process.env.USD_INR_RATE, 88),
+  };
+}
+
+function usageCost(usage, rates) {
+  if (!usage || !usage.promptTokenCount) return null;
+  const details = Array.isArray(usage.promptTokensDetails) ? usage.promptTokensDetails : [];
+  const audioIn = details.filter((d) => String(d.modality).toUpperCase() === "AUDIO").reduce((n, d) => n + (Number(d.tokenCount) || 0), 0);
+  const textIn = Math.max((Number(usage.promptTokenCount) || 0) - audioIn, 0);
+  const out = (Number(usage.candidatesTokenCount) || 0) + (Number(usage.thoughtsTokenCount) || 0);
+  const usd = (textIn * rates.textIn + audioIn * rates.audioIn + out * rates.out) / 1e6;
+  return { usd, audioIn, textIn, out, model: usage.model || null };
+}
+
+function fmtInr(usd, rate) {
+  return `₹${(usd * rate).toFixed(2)}`;
+}
+
+/** "[GEMINI CHARGES]" text block, or "" when no Gemini call was made for this call. */
+function buildGeminiChargesBlock(geminiUsage) {
+  const rates = geminiRates();
+  const t = usageCost(geminiUsage?.transcription, rates);
+  const m = usageCost(geminiUsage?.mom, rates);
+  if (!t && !m) return "";
+  const totalUsd = (t?.usd || 0) + (m?.usd || 0);
+  const tokens = (n) => Number(n || 0).toLocaleString("en-IN");
+  const lines = [
+    "[GEMINI CHARGES]",
+    `Total: ${fmtInr(totalUsd, rates.usdInr)} ($${totalUsd.toFixed(4)}) (est.)`,
+  ];
+  if (t) lines.push(`Transcript: ${fmtInr(t.usd, rates.usdInr)} — ${tokens(t.audioIn)} audio + ${tokens(t.textIn)} text tokens in, ${tokens(t.out)} out`);
+  if (m) lines.push(`MoM: ${fmtInr(m.usd, rates.usdInr)} — ${tokens(m.textIn)} tokens in, ${tokens(m.out)} out`);
+  const model = m?.model || t?.model;
+  if (model) lines.push(`Model: ${model}`);
+  return lines.join("\n");
+}
+
 /** Short, key-free reason from a Gemini error body (shown on the call so failures are diagnosable). */
 function geminiErrorReason(status, errorText) {
   let msg = "";
@@ -296,12 +342,14 @@ async function transcribeRecordingWithGemini(apiKey, recordingUrl, callId) {
       });
 
       if (result.ok) {
+        const usage = { model: result.model, ...(result.data?.usageMetadata || {}) };
         const text = geminiResponseText(result.data);
-        if (text) return { text, reason: "" };
+        if (text) return { text, reason: "", usage };
         const finish = result.data?.candidates?.[0]?.finishReason;
         const blocked = result.data?.promptFeedback?.blockReason;
         return {
           text: "",
+          usage,
           reason: blocked ? `Gemini blocked the audio (${blocked})` : `no speech detected in the recording${finish && finish !== "STOP" ? ` (finish: ${finish})` : ""}`,
         };
       }
@@ -443,6 +491,7 @@ async function processCallWithAi(tenantId, callId) {
   let transcript = "";
   let transcriptSource = null; // "existing" | "gemini" | null
   let transcriptFailReason = "";
+  const geminiUsage = { transcription: null, mom: null }; // for "Gemini charges" on the MoM
   let summaryText = NO_RECORDING_MSG;
   let structuredSummary = null;
   let sentiment = "neutral";
@@ -489,6 +538,7 @@ async function processCallWithAi(tenantId, callId) {
         const tr = await transcribeRecordingWithGemini(apiKey, call.recording_url, callId);
         transcript = String(tr?.text || "").trim();
         transcriptFailReason = tr?.reason || "";
+        if (tr?.usage) geminiUsage.transcription = tr.usage;
         if (transcript) transcriptSource = "gemini";
       } catch (err) {
         transcriptFailReason = err.message;
@@ -595,6 +645,7 @@ Return JSON with exact keys:
         });
 
         if (geminiRes.ok) {
+          geminiUsage.mom = { model: geminiRes.model, ...(geminiRes.data?.usageMetadata || {}) };
           const content = geminiResponseText(geminiRes.data);
           if (!content) {
             logger.error("Gemini returned an empty response body", {
@@ -639,6 +690,11 @@ Return JSON with exact keys:
       }
     }
   }
+
+  // Per-call Gemini charges, shown at the TOP of the MoM (stored inside ai_summary as a
+  // "[GEMINI CHARGES]" block — no schema change). Only when Gemini was actually called.
+  const chargesBlock = buildGeminiChargesBlock(geminiUsage);
+  if (chargesBlock) summaryText = `${chargesBlock}\n\n${summaryText}`;
 
   // Update employee_calls in DB
   try {
@@ -726,7 +782,7 @@ async function ensureAllCallsProcessedWithAi(tenantId = "default") {
              AND (
                ai_summary LIKE '[TRANSCRIPT ON FILE]%'
                OR ai_summary LIKE '[REAL AUDIO TRANSCRIPT]%'
-               OR ai_summary LIKE '[AI SUMMARY PENDING]%'
+               OR ai_summary LIKE '%[AI SUMMARY PENDING]%'
              )
            )
          )

@@ -930,6 +930,27 @@ router.get("/employee/:employeeId/pipeline/board", requireEmployeeSelf(), asyncR
     payload.totals = { ...(payload.totals || {}), meetings: payload.meetings.length };
   }
 
+  // Dial count per lead (all-time outbound attempts, any employee) for the lead cards —
+  // "Dialed 3×". One GROUP BY over this employee's assigned leads.
+  try {
+    const dialRes = await pool.query(
+      `SELECT ec.lead_id, COUNT(*) AS dials
+       FROM employee_calls ec
+       WHERE ec.tenant_id = $1
+         AND ec.lead_id IN (SELECT l.id FROM leads l WHERE l.tenant_id = $1 AND l.assigned_to = $2 AND l.is_deleted = 0)
+         AND (
+           LOWER(COALESCE(ec.direction, '')) IN ('outbound', 'out', 'outgoing')
+           OR LOWER(COALESCE(ec.outcome, '')) REGEXP 'not connected|not pick|rejected|no answer|busy|unanswered|not answered'
+         )
+       GROUP BY ec.lead_id`,
+      [tenantId, employeeId],
+    );
+    payload.dialCounts = Object.fromEntries(dialRes.rows.map((r) => [String(r.lead_id), Number(r.dials) || 0]));
+  } catch (err) {
+    logger.warn("Dial count query failed (board unaffected)", { employeeId, error: err.message });
+    payload.dialCounts = {};
+  }
+
   return ok(res, payload, {
     syncedAt: new Date().toISOString(),
     period,
