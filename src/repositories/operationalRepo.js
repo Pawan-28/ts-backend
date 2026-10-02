@@ -1,6 +1,7 @@
 const pool = require("../../config/db");
 const { buildPeriodDateFilter, buildPeriodOrCustomDateFilter } = require("../utils/periodFilter");
 const { toLocalSqlString } = require("../utils/appTimezone");
+const { extractTracking } = require("../utils/leadMeta");
 
 const DEFAULT_TENANT_ID = "default";
 const DEFAULT_CALL_LIST_LIMIT = Number(process.env.EMPLOYEE_CALLS_MAX || 10000);
@@ -16,6 +17,9 @@ function mapLead(row, assignedEmployee) {
   if (!row) return null;
   const emp = assignedEmployee || joinEmployee(row);
   const empName = emp?.name || emp?.emp_name || row.assignee_name || row.employee_name || row.assigned_employee || "";
+  const sourceMeta = typeof row.source_meta === "string" ? (() => { try { return JSON.parse(row.source_meta || "{}"); } catch { return {}; } })() : (row.source_meta || {});
+  // UTMs + SOP id as sent by n8n / forms / bulk upload, whatever key spelling or nesting.
+  const tracking = extractTracking(sourceMeta);
   const lead = {
     id: row.id,
     tenantId: row.tenant_id,
@@ -26,7 +30,13 @@ function mapLead(row, assignedEmployee) {
     city: row.city,
     country: row.country,
     source: row.source,
-    sourceMeta: typeof row.source_meta === "string" ? (() => { try { return JSON.parse(row.source_meta || "{}"); } catch { return {}; } })() : (row.source_meta || {}),
+    sourceMeta,
+    utm_source: tracking.utm_source,
+    utm_medium: tracking.utm_medium,
+    utm_campaign: tracking.utm_campaign,
+    utm_term: tracking.utm_term,
+    utm_content: tracking.utm_content,
+    sopId: (row.sop_id != null && row.sop_id !== "" ? String(row.sop_id) : "") || tracking.sopId,
     formName: row.form_name,
     pipelineStage: row.pipeline_stage,
     stageIsManual: Boolean(row.stage_is_manual),
@@ -1653,6 +1663,7 @@ function mapCashCollection(row) {
     amount: Number(row.amount) || 0,
     currency: row.currency || "INR",
     paymentMode: row.payment_mode,
+    paymentType: row.payment_type || null,
     paymentAt: row.payment_at,
     transactionId: row.transaction_id,
     slipUrl: row.slip_url,
@@ -1667,7 +1678,49 @@ function mapCashCollection(row) {
   };
 }
 
+// Adds cash_collections.payment_type on servers that have not restarted since init.js gained it.
+let cashPaymentTypeReady = null;
+function ensureCashPaymentTypeColumn() {
+  if (!cashPaymentTypeReady) {
+    cashPaymentTypeReady = pool
+      .query("ALTER TABLE cash_collections ADD COLUMN payment_type VARCHAR(50) NULL")
+      .then(() => true)
+      .catch((error) => {
+        if (error.code === "ER_DUP_FIELDNAME") return true;
+        cashPaymentTypeReady = null; // retry later
+        return false;
+      });
+  }
+  return cashPaymentTypeReady;
+}
+
 async function insertCashCollection(data) {
+  const hasType = await ensureCashPaymentTypeColumn();
+  if (hasType) {
+    const result = await pool.query(
+      `INSERT INTO cash_collections
+        (tenant_id, lead_id, employee_id, amount, currency, payment_mode, payment_type, payment_at,
+         transaction_id, slip_url, slip_filename, notes, recorded_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       RETURNING *`,
+      [
+        data.tenantId,
+        data.leadId,
+        data.employeeId || null,
+        data.amount,
+        data.currency || "INR",
+        data.paymentMode,
+        data.paymentType || null,
+        data.paymentAt,
+        data.transactionId || null,
+        data.slipUrl || null,
+        data.slipFilename || null,
+        data.notes || null,
+        data.recordedBy || null,
+      ],
+    );
+    return mapCashCollection(result.rows[0]);
+  }
   const result = await pool.query(
     `INSERT INTO cash_collections
       (tenant_id, lead_id, employee_id, amount, currency, payment_mode, payment_at,

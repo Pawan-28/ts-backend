@@ -1,4 +1,5 @@
 const repo = require("../repositories/operationalRepo");
+const { extractTracking, cleanValue } = require("../utils/leadMeta");
 const { buildClarityCallTitle, resolveCustomerName } = require("../utils/meetingTitle");
 const { emitTenant, emitEmployee } = require("../realtime/socket");
 const { cacheGet, cacheSet } = require("../config/redis");
@@ -37,13 +38,15 @@ function normalizeLeadInput(input = {}) {
     notesAndReqs = notesAndReqs ? `[Service: ${servicesFormatted}] ${notesAndReqs}` : `Service: ${servicesFormatted}`;
   }
 
-  const utmSource = input.utm_source || input.utmSource || "";
-  const utmMedium = input.utm_medium || input.utmMedium || "";
-  const utmCampaign = input.utm_campaign || input.utmCampaign || "";
-  const utmTerm = input.utm_term || input.utmTerm || "";
-  const utmContent = input.utm_content || input.utmContent || "";
+  // Any spelling / nesting the sender used (utmSource, "UTM Source", body.utm_source, …).
+  const tracking = extractTracking(input, input.sourceMeta, input.rawPayload);
+  const utmSource = tracking.utm_source;
+  const utmMedium = tracking.utm_medium;
+  const utmCampaign = tracking.utm_campaign;
+  const utmTerm = tracking.utm_term;
+  const utmContent = tracking.utm_content;
   const serviceId = input.serviceId || input.service_id || "";
-  const sopId = input.sopId || input.sop_id || "";
+  const sopId = tracking.sopId || cleanValue(input.sopId || input.sop_id);
 
   // Prioritize genuine marketing sources over generic "n8n"
   const candidateSource = (input.source && input.source !== "n8n") 

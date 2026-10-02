@@ -10,6 +10,7 @@ const { logger } = require("../config/logger");
 const { mapStageToId } = require("../utils/pipelineStages");
 const { toIndianMobile10 } = require("../utils/phone");
 const { cleanServiceName } = require("../utils/meetingTitle");
+const { extractTracking } = require("../utils/leadMeta");
 
 // LEAD_STATUS_WEBHOOK_URL (server env) overrides it if set; .env is not modified.
 const DEFAULT_LEAD_STATUS_WEBHOOK_URL = "https://n8n.srv1000386.hstgr.cloud/webhook/1b186ff4-3be6-484b-9b68-a124d8c8d2c1";
@@ -92,7 +93,11 @@ async function resolveSopId(lead, meta) {
   );
   if (leadSop) return leadSop.sop_code || String(leadSop.id);
 
-  // 2. SOP the CRM applies to this lead's current service (same matching as the AI MoM).
+  // 2. SOP id sent with the lead (n8n / form / bulk upload) — what the sender assigned.
+  const sentSop = emptyToNull(extractTracking(meta).sopId);
+  if (sentSop) return sentSop;
+
+  // 3. SOP the CRM applies to this lead's current service (same matching as the AI MoM).
   const serviceName = cleanServiceName(lead.requirements) || cleanServiceName(meta.services) || cleanServiceName(meta.service);
   try {
     const result = await pool.query(`SELECT id, sop_code, service, services FROM sops WHERE status <> 'Archived' ORDER BY updated_at DESC`);
@@ -108,7 +113,6 @@ async function resolveSopId(lead, meta) {
     // sops table unavailable — fall through
   }
 
-  // 3. SOP code captured when the lead was created.
   return emptyToNull(meta.sopId || meta.sop_id);
 }
 
@@ -127,6 +131,7 @@ async function resolveEmployeeId(tenantId, assignedTo) {
 /** Build the payload from the lead's CURRENT database row. */
 async function buildPayload(tenantId, leadRow, status) {
   const meta = parseJson(leadRow.source_meta);
+  const tracking = extractTracking(meta);
   const phone10 = toIndianMobile10(leadRow.phone);
   const expected = leadRow.expected_revenue;
   return {
@@ -141,11 +146,11 @@ async function buildPayload(tenantId, leadRow, status) {
     sopId: await resolveSopId(leadRow, meta),
     pipelineStage: emptyToNull(leadRow.pipeline_stage),
     expectedRevenue: expected === null || expected === undefined || expected === "" ? null : String(Number(expected)),
-    utm_source: emptyToNull(meta.utm_source ?? meta.utmSource),
-    utm_medium: emptyToNull(meta.utm_medium ?? meta.utmMedium),
-    utm_campaign: emptyToNull(meta.utm_campaign ?? meta.utmCampaign),
-    utm_term: emptyToNull(meta.utm_term ?? meta.utmTerm),
-    utm_content: emptyToNull(meta.utm_content ?? meta.utmContent),
+    utm_source: emptyToNull(tracking.utm_source),
+    utm_medium: emptyToNull(tracking.utm_medium),
+    utm_campaign: emptyToNull(tracking.utm_campaign),
+    utm_term: emptyToNull(tracking.utm_term),
+    utm_content: emptyToNull(tracking.utm_content),
   };
 }
 

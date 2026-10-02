@@ -619,6 +619,13 @@ async function initDatabase() {
       if (error.code !== "ER_DUP_FIELDNAME") throw error;
     });
 
+    // Payment type for each cash entry (Advance Payment / Full Payment / Partial Payment / Other).
+    await pool.query(`
+      ALTER TABLE cash_collections ADD COLUMN payment_type VARCHAR(50) NULL
+    `).catch((error) => {
+      if (error.code !== "ER_DUP_FIELDNAME") throw error;
+    });
+
     await pool.query(`
       ALTER TABLE sops ADD COLUMN scripts JSON DEFAULT ('[]')
     `).catch((error) => {

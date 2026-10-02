@@ -140,6 +140,8 @@ const cashCollectionSchema = z.object({
   amount: z.coerce.number().positive(),
   paymentMode: z.string().optional(),
   payment_mode: z.string().optional(),
+  paymentType: z.string().max(50).optional().nullable(),
+  payment_type: z.string().max(50).optional().nullable(),
   paymentAt: z.coerce.date().optional(),
   payment_at: z.coerce.date().optional(),
   transactionId: z.string().optional().nullable(),

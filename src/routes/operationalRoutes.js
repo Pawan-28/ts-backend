@@ -240,6 +240,12 @@ router.post("/leads/bulk-upload", upload.single("file"), asyncRoute(async (req, 
           data.currency = cleanedVal;
         } else if (["priority"].includes(normalizedKey)) {
           data.priority = cleanedVal;
+        } else if (["utmsource", "utmmedium", "utmcampaign", "utmterm", "utmcontent"].includes(normalizedKey)) {
+          data[`utm_${normalizedKey.slice(3)}`] = cleanedVal;
+        } else if (["sopid", "sopcode", "sop"].includes(normalizedKey)) {
+          data.sop_id = cleanedVal;
+        } else if (["serviceid", "servicecode"].includes(normalizedKey)) {
+          data.service_id = cleanedVal;
         }
       }
       return data;
@@ -282,6 +288,13 @@ router.post("/leads/bulk-upload", upload.single("file"), asyncRoute(async (req, 
             integration: "bulk_upload",
             channel: leadData.source || "manual",
             service: leadData.service || "",
+            ...(leadData.utm_source ? { utm_source: leadData.utm_source } : {}),
+            ...(leadData.utm_medium ? { utm_medium: leadData.utm_medium } : {}),
+            ...(leadData.utm_campaign ? { utm_campaign: leadData.utm_campaign } : {}),
+            ...(leadData.utm_term ? { utm_term: leadData.utm_term } : {}),
+            ...(leadData.utm_content ? { utm_content: leadData.utm_content } : {}),
+            ...(leadData.sop_id ? { sopId: leadData.sop_id } : {}),
+            ...(leadData.service_id ? { serviceId: leadData.service_id } : {}),
           }
         };
 
@@ -346,7 +359,24 @@ router.get("/leads/:id", requireEmployeeOwnsLead(), asyncRoute(async (req, res) 
 }));
 
 router.put("/leads/:id", requireEmployeeOwnsLead(), asyncRoute(async (req, res) => {
-  const lead = await repo.updateLead(tenant(req), req.params.id, { ...req.body, lastActivityAt: new Date() });
+  const patch = { ...req.body, lastActivityAt: new Date() };
+  // UTM fields edited in Lead Details live in source_meta — merge them (non-empty only)
+  // without dropping anything n8n stored there.
+  const UTM_KEYS = ["utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content"];
+  const utmEdits = UTM_KEYS.filter((k) => typeof req.body?.[k] === "string" && req.body[k].trim());
+  if (utmEdits.length && !req.body.sourceMeta) {
+    const existing = await repo.findLeadById(tenant(req), req.params.id).catch(() => null);
+    if (existing) {
+      const meta = { ...(existing.sourceMeta || {}) };
+      let changed = false;
+      for (const k of utmEdits) {
+        const v = req.body[k].trim();
+        if (v !== existing[k]) { meta[k] = v; changed = true; }
+      }
+      if (changed) patch.sourceMeta = meta;
+    }
+  }
+  const lead = await repo.updateLead(tenant(req), req.params.id, patch);
   if (!lead) return res.status(404).json({ success: false, message: "Lead not found" });
   await writeTimeline({ tenantId: tenant(req), leadId: lead.id, type: "status_change", summary: "Lead updated", payload: req.body, actor: actor(req) });
   return ok(res, lead);
@@ -414,6 +444,7 @@ router.post("/leads/:id/cash-collections", upload.single("slip"), requireEmploye
   const body = {
     amount: req.body.amount,
     paymentMode: req.body.paymentMode || req.body.payment_mode,
+    paymentType: req.body.paymentType || req.body.payment_type || undefined,
     paymentAt: req.body.paymentAt || req.body.payment_at,
     transactionId: req.body.transactionId || req.body.transaction_id,
     notes: req.body.notes,
@@ -457,6 +488,7 @@ router.post("/leads/:id/cash-collections", upload.single("slip"), requireEmploye
     amount: data.amount,
     currency: data.currency || "INR",
     paymentMode: data.paymentMode || data.payment_mode,
+    paymentType: (data.paymentType || data.payment_type || "").trim() || null,
     paymentAt,
     transactionId: transactionId || null,
     slipUrl,
@@ -469,8 +501,8 @@ router.post("/leads/:id/cash-collections", upload.single("slip"), requireEmploye
     tenantId: tenant(req),
     leadId: req.params.id,
     type: "payment",
-    summary: `Cash collected: ₹${Number(data.amount).toLocaleString("en-IN")} via ${data.paymentMode || data.payment_mode}`,
-    payload: { amount: data.amount, paymentMode: data.paymentMode || data.payment_mode, transactionId: transactionId || null },
+    summary: `Cash collected${record?.paymentType ? ` (${record.paymentType})` : ""}: ₹${Number(data.amount).toLocaleString("en-IN")} via ${data.paymentMode || data.payment_mode}`,
+    payload: { amount: data.amount, paymentType: record?.paymentType || null, paymentMode: data.paymentMode || data.payment_mode, transactionId: transactionId || null },
     actor: actor(req),
   });
 
