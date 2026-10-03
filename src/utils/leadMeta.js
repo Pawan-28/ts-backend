@@ -2,12 +2,13 @@
 // way the sender spelled or nested them: utm_source, utmSource, "UTM Source", "utm-source",
 // { utm: { source } }, { body: { utm_source } }, { rawPayload: {...} }, sop_id, sopCode, …
 const FIELD_KEYS = {
-  utm_source: ["utmsource", "utmsrc"],
-  utm_medium: ["utmmedium"],
-  utm_campaign: ["utmcampaign", "utmcampaignname", "campaignname"],
-  utm_term: ["utmterm", "utmkeyword"],
-  utm_content: ["utmcontent", "utmadcontent"],
-  sopId: ["sopid", "sopcode", "sopno", "sopnumber"],
+  utm_source: ["utmsource", "utmsrc", "utmsite"],
+  utm_medium: ["utmmedium", "utmchannel"],
+  // Meta / Google lead-ad exports use campaign_name, adset_name, ad_name instead of utm_*.
+  utm_campaign: ["utmcampaign", "utmcampaignname", "campaignname", "campaign"],
+  utm_term: ["utmterm", "utmkeyword", "adsetname", "keyword", "searchterm"],
+  utm_content: ["utmcontent", "utmadcontent", "adname", "adcontent", "creative"],
+  sopId: ["sopid", "sopcode", "sopno", "sopnumber", "sopref", "sopcodeid"],
 };
 const UTM_GROUP_KEYS = { utm_source: "source", utm_medium: "medium", utm_campaign: "campaign", utm_term: "term", utm_content: "content" };
 const NESTED_KEYS = ["body", "data", "json", "payload", "rawpayload", "query", "params", "lead", "fields", "utm", "utms", "utmparams", "tracking", "attribution", "meta", "sourcemeta"];
@@ -72,4 +73,19 @@ function extractTracking(...sources) {
   return out;
 }
 
-module.exports = { findLeadMetaValue, extractTracking, cleanValue };
+// Sources that say nothing about the marketing channel — never used as a UTM Source fallback.
+const NON_CHANNEL_SOURCES = new Set(["n8n", "manual", "api", "callyzer", "bulk_upload", "webhook", "website", "third_party", "form", "unknown", "sheet"]);
+
+/** Fills a blank utm_source from the lead's own ad channel (e.g. meta_ads) so the field is never empty
+ *  for ad leads whose sender did not pass UTM params. Real UTM values always win. */
+function withUtmSourceFallback(tracking, lead, meta) {
+  if (tracking.utm_source) return tracking;
+  const candidates = [meta?.channel, meta?.source, meta?.platform, lead?.source];
+  for (const c of candidates) {
+    const v = cleanValue(c);
+    if (v && !NON_CHANNEL_SOURCES.has(v.toLowerCase())) return { ...tracking, utm_source: v };
+  }
+  return tracking;
+}
+
+module.exports = { findLeadMetaValue, extractTracking, cleanValue, withUtmSourceFallback };

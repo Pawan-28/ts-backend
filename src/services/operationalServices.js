@@ -399,6 +399,14 @@ async function createLead(input, options = {}) {
   };
 
   const normalized = normalizeLeadInput(enrichedInput);
+  // Store the canonical SOP code (e.g. SOP-007) + name, even when the sender passed a numeric id or a title.
+  if (resolvedSop) {
+    normalized.sourceMeta = {
+      ...(normalized.sourceMeta || {}),
+      sopId: resolvedSop.sop_code || String(resolvedSop.id),
+      sop: resolvedSop.title || normalized.sourceMeta?.sop,
+    };
+  }
   const lead = await repo.insertLead(tenantId, normalized);
 
   // Auto-create service in catalog if a service is specified for this lead

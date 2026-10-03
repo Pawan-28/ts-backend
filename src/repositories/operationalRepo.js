@@ -1,7 +1,7 @@
 const pool = require("../../config/db");
 const { buildPeriodDateFilter, buildPeriodOrCustomDateFilter } = require("../utils/periodFilter");
 const { toLocalSqlString } = require("../utils/appTimezone");
-const { extractTracking } = require("../utils/leadMeta");
+const { extractTracking, withUtmSourceFallback } = require("../utils/leadMeta");
 
 const DEFAULT_TENANT_ID = "default";
 const DEFAULT_CALL_LIST_LIMIT = Number(process.env.EMPLOYEE_CALLS_MAX || 10000);
@@ -19,7 +19,7 @@ function mapLead(row, assignedEmployee) {
   const empName = emp?.name || emp?.emp_name || row.assignee_name || row.employee_name || row.assigned_employee || "";
   const sourceMeta = typeof row.source_meta === "string" ? (() => { try { return JSON.parse(row.source_meta || "{}"); } catch { return {}; } })() : (row.source_meta || {});
   // UTMs + SOP id as sent by n8n / forms / bulk upload, whatever key spelling or nesting.
-  const tracking = extractTracking(sourceMeta);
+  const tracking = withUtmSourceFallback(extractTracking(sourceMeta), { source: row.source }, sourceMeta);
   const lead = {
     id: row.id,
     tenantId: row.tenant_id,
