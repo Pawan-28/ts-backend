@@ -722,6 +722,30 @@ async function getCallsForEmployee(tenantId, employee, { dbCalls = [], leads = [
               logger.error("Failed to update call direction", { callyzerCallId: log.id, message: e.message });
             }
           }
+          // Callyzer uploads the recording AFTER the call, so the first sync stores none. Pick it up on later syncs
+          // and re-run the AI MoM (the earlier summary was only a "no recording" placeholder).
+          if (log.call_recording_url && !dbCall.recordingUrl) {
+            dbCall.recordingUrl = log.call_recording_url;
+            try {
+              const placeholder = !dbCall.aiSummary
+                || /No call recording|AI UNAVAILABLE|TRANSCRIPT UNAVAILABLE/i.test(String(dbCall.aiSummary))
+                || /No call recording/i.test(String(dbCall.notes || ""));
+              await pool.query(
+                placeholder
+                  ? "UPDATE employee_calls SET recording_url = $1, ai_summary = NULL, notes = NULL, transcript = NULL WHERE tenant_id = $2 AND callyzer_call_id = $3"
+                  : "UPDATE employee_calls SET recording_url = $1 WHERE tenant_id = $2 AND callyzer_call_id = $3",
+                [log.call_recording_url, tenantId, log.id],
+              );
+              if (placeholder && dbCall.id) {
+                const { processCallWithAi } = require("./aiService");
+                processCallWithAi(tenantId, dbCall.id).catch((err) => {
+                  logger.warn("AI processing after late recording failed", { callId: dbCall.id, error: err.message });
+                });
+              }
+            } catch (e) {
+              logger.error("Failed to attach late recording", { callyzerCallId: log.id, message: e.message });
+            }
+          }
           if (!dbCall.leadId && leadId) {
             dbCall.leadId = leadId;
             try {
