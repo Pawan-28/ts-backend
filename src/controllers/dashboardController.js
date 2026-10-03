@@ -180,7 +180,105 @@ const getLeadById = async (req, res) => {
   });
 };
 
+// ── AI (Gemini) cost for call transcripts + MoM summaries ───────────────────────────
+// Each processed call stores a "[GEMINI CHARGES]" block at the top of employee_calls.ai_summary
+// (see aiService.buildGeminiChargesBlock). This reads those blocks back and totals them.
+const pool = require("../../config/db");
+const { buildPeriodOrCustomDateFilter, isValidDateKey } = require("../utils/periodFilter");
+
+const APP_TZ_MIN = (() => {
+  const m = String(process.env.APP_TZ_OFFSET || "+05:30").match(/^([+-])(\d{2}):(\d{2})$/);
+  return m ? (m[1] === "-" ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3])) : 330;
+})();
+
+const istToday = () => new Date(Date.now() + APP_TZ_MIN * 60000).toISOString().slice(0, 10);
+const addDays = (key, n) => new Date(new Date(`${key}T00:00:00Z`).getTime() + n * 86400000).toISOString().slice(0, 10);
+
+function parseGeminiCharges(summary) {
+  const text = String(summary || "");
+  const at = text.indexOf("[GEMINI CHARGES]");
+  if (at < 0) return null;
+  const block = text.slice(at, at + 700);
+  const total = block.match(/Total:\s*₹\s*([\d,.]+)\s*\(\$\s*([\d.]+)\)/);
+  if (!total) return null;
+  const inr = (re) => { const m = block.match(re); return m ? Number(m[1].replace(/,/g, "")) : 0; };
+  return {
+    inr: Number(total[1].replace(/,/g, "")),
+    usd: Number(total[2]),
+    transcriptInr: inr(/Transcript:\s*₹\s*([\d,.]+)/),
+    momInr: inr(/MoM:\s*₹\s*([\d,.]+)/),
+  };
+}
+
+async function aiCostForFilter(filter) {
+  const col = "COALESCE(started_at, created_at)";
+  const { rows } = await pool.query(
+    `SELECT DATE_FORMAT(${col}, '%Y-%m-%d') AS day, SUBSTRING(ai_summary, 1, 900) AS head
+     FROM employee_calls
+     WHERE ai_summary LIKE '%[GEMINI CHARGES]%' AND ${filter.clause}`,
+    filter.params,
+  );
+  const out = { inr: 0, usd: 0, transcriptInr: 0, momInr: 0, calls: 0, byDay: {} };
+  for (const r of rows) {
+    const c = parseGeminiCharges(r.head);
+    if (!c) continue;
+    out.inr += c.inr; out.usd += c.usd; out.transcriptInr += c.transcriptInr; out.momInr += c.momInr; out.calls += 1;
+    const d = (out.byDay[r.day] ||= { inr: 0, usd: 0, calls: 0 });
+    d.inr += c.inr; d.usd += c.usd; d.calls += 1;
+  }
+  return out;
+}
+
+const round2 = (n) => Math.round(n * 100) / 100;
+const shape = (t) => ({ inr: round2(t.inr), usd: Math.round(t.usd * 10000) / 10000, transcriptInr: round2(t.transcriptInr), momInr: round2(t.momInr), calls: t.calls });
+
+const getAiCost = async (req, res) => {
+  try {
+    if (req.user?.role === "employee") {
+      return res.status(403).json({ success: false, message: "Admin access required" });
+    }
+    const period = String(req.query.period || req.query.range || "month").toLowerCase();
+    const startDate = isValidDateKey(req.query.startDate) ? req.query.startDate : null;
+    const endDate = isValidDateKey(req.query.endDate) ? req.query.endDate : null;
+    const mk = (opts) => buildPeriodOrCustomDateFilter({ ...opts, column: "COALESCE(started_at, created_at)", paramOffset: 1 });
+
+    const [selected, today, week, month] = await Promise.all([
+      aiCostForFilter(mk({ period, startDate, endDate })),
+      aiCostForFilter(mk({ period: "today" })),
+      aiCostForFilter(mk({ period: "week" })),
+      aiCostForFilter(mk({ period: "month" })),
+    ]);
+
+    // Daily series: custom → From–To (max 92 days); week → Mon..today; month → 1st..today; today → last 7 days.
+    const t = istToday();
+    let from; let to = t;
+    if (period === "custom" && startDate && endDate) { from = startDate; to = endDate; if (new Date(to) - new Date(from) > 92 * 86400000) from = addDays(to, -92); }
+    else if (period === "week" || period === "this_week") { const dow = (new Date(`${t}T00:00:00Z`).getUTCDay() + 6) % 7; from = addDays(t, -dow); }
+    else if (period === "today" || period === "day") from = addDays(t, -6);
+    else from = `${t.slice(0, 7)}-01`;
+    const daily = [];
+    for (let d = from; d <= to; d = addDays(d, 1)) {
+      const v = selected.byDay[d] || { inr: 0, usd: 0, calls: 0 };
+      daily.push({ date: d, inr: round2(v.inr), usd: Math.round(v.usd * 10000) / 10000, calls: v.calls });
+    }
+
+    res.json({
+      success: true,
+      period,
+      selected: shape(selected),
+      today: shape(today),
+      week: shape(week),
+      month: shape(month),
+      daily,
+      note: "Estimated from Gemini token usage stored with each call's AI summary.",
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
 module.exports = {
+  getAiCost,
   getDashboard,
   getRevenue,
   getPipeline,
