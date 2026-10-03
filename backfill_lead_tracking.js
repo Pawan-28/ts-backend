@@ -12,6 +12,15 @@ const norm = (v) => String(v ?? "").trim().toLowerCase();
 const parse = (v) => { if (!v) return {}; if (typeof v === "object") return v; try { return JSON.parse(v); } catch { return {}; } };
 
 (async () => {
+  // 0. Give every SOP a code (SOP-001, SOP-002, …) when it has none.
+  const all = (await pool.query("SELECT id, sop_code FROM sops ORDER BY id ASC")).rows;
+  let maxNum = Math.max(0, ...all.map((r) => parseInt(String(r.sop_code || "").replace("SOP-", ""), 10)).filter((n) => !isNaN(n)));
+  for (const r of all.filter((x) => !x.sop_code)) {
+    maxNum += 1;
+    const code = `SOP-${String(maxNum).padStart(3, "0")}`;
+    console.log(`${APPLY ? "Assigning" : "Would assign"} ${code} to SOP id ${r.id}`);
+    if (APPLY) await pool.query("UPDATE sops SET sop_code = $1 WHERE id = $2", [code, r.id]);
+  }
   const sopsRes = await pool.query("SELECT id, sop_code, title, service, services, status FROM sops");
   const sops = sopsRes.rows.filter((s) => norm(s.status) !== "archived").map((s) => {
     let services = parse(s.services);

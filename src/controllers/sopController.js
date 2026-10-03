@@ -75,6 +75,15 @@ async function insertSopRow(values) {
     err.statusCode = 500;
     throw err;
   }
+  // Every SOP needs a short code (SOP-007) — leads, n8n and the lead panel reference it.
+  try {
+    const codes = await pool.query("SELECT sop_code FROM sops WHERE sop_code LIKE 'SOP-%'");
+    const nums = (codes.rows || []).map((r) => parseInt(String(r.sop_code).replace("SOP-", ""), 10)).filter((n) => !isNaN(n));
+    const next = `SOP-${String((nums.length ? Math.max(...nums) : 0) + 1).padStart(3, "0")}`;
+    await pool.query("UPDATE sops SET sop_code = $1 WHERE id = $2 AND (sop_code IS NULL OR sop_code = '')", [next, insertId]);
+  } catch (codeErr) {
+    logger.warn("Could not assign sop_code to new SOP", { insertId, message: codeErr.message });
+  }
   const sop = await fetchSopById(insertId);
   if (!sop) {
     const err = new Error("SOP created but could not be loaded");
