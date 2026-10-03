@@ -9,7 +9,7 @@ let started = false;
 async function processQueueTick() {
   if (!isPgReady()) return;
   try {
-    await processAssignmentQueue(DEFAULT_TENANT_ID, { limit: 25 });
+    await processAssignmentQueue(DEFAULT_TENANT_ID, { limit: 100 });
   } catch (err) {
     logger.warn(`assignment queue tick failed: ${err.message}`);
   }

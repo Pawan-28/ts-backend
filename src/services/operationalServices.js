@@ -578,6 +578,9 @@ async function createLead(input, options = {}) {
   };
 }
 
+const DEFAULT_MAX_ACTIVE_LEADS = Number(process.env.RR_MAX_ACTIVE_LEADS) || 5000;
+const DEFAULT_DAILY_ASSIGNMENTS = Number(process.env.RR_DAILY_LIMIT) || 1000;
+
 async function getOrCreateAssignmentConfig(tenantId) {
   let config = await repo.getAssignmentConfig(tenantId);
   if (!config) {
@@ -624,8 +627,10 @@ async function pickEmployee(tenantId, config) {
   const employees = await eligibleEmployees(tenantId, config);
   const filtered = employees.filter((e) => {
     const active = e.capacity?.currentActiveLeads || 0;
-    const maxActive = config.workloadRules?.maxActiveLeads || e.capacity?.maxActiveLeads || 40;
-    const dailyLimit = config.workloadRules?.maxDailyAssignments || e.capacity?.dailyLimit || 25;
+    // Limits come from the admin's workload rules, else generous defaults (env-tunable).
+    // The old per-employee 40 / 25 column defaults are ignored — they blocked every rep once the backlog grew.
+    const maxActive = Number(config.workloadRules?.maxActiveLeads) || DEFAULT_MAX_ACTIVE_LEADS;
+    const dailyLimit = Number(config.workloadRules?.maxDailyAssignments) || DEFAULT_DAILY_ASSIGNMENTS;
     return active < maxActive && todayCount(config, e.id) < dailyLimit;
   });
 
@@ -728,7 +733,12 @@ async function processAssignmentQueue(tenantId, options = {}) {
     return { processed: 0, skipped: "auto_assign_disabled" };
   }
 
-  const limit = Number(options.limit || 25);
+  const limit = Math.min(Number(options.limit || 25), 5000);
+  // Backlog refill: unassigned leads that never got a queue row, or whose row failed with
+  // "No eligible employees", go (back) into the queue so a drained pool picks them up.
+  if (options.refill !== false) {
+    try { await repo.enqueueUnassignedLeads(tenantId, limit); } catch (e) { console.error("[assignment] refill failed:", e.message); }
+  }
   const queueItems = await repo.getQueuedItems(tenantId, limit);
 
   let processed = 0;
@@ -739,9 +749,10 @@ async function processAssignmentQueue(tenantId, options = {}) {
 
     const employee = await pickEmployee(tenantId, config);
     if (!employee) {
-      await repo.updateQueueItem(item.id, { status: "failed", failureReason: "No eligible employees" });
+      // Nobody can take leads right now — keep the lead queued (not failed) and stop; the next run retries.
+      await repo.updateQueueItem(item.id, { status: "queued", failureReason: "No eligible employees" });
       failures.push({ queueId: item.id, reason: "No eligible employees" });
-      continue;
+      break;
     }
 
     try {

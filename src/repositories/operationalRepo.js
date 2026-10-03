@@ -709,6 +709,31 @@ async function getQueuedItems(tenantId, limit) {
   return result.rows.map((r) => mapQueueItem(r));
 }
 
+/** Queues unassigned leads that have no active queue row (and re-queues ones that failed for lack of reps). */
+async function enqueueUnassignedLeads(tenantId, limit = 500) {
+  await pool.query(
+    `UPDATE lead_assignment_queue SET status = 'queued'
+     WHERE tenant_id = $1 AND status = 'failed' AND failure_reason = 'No eligible employees'`,
+    [tenantId],
+  ).catch(() => {});
+  const result = await pool.query(
+    `INSERT INTO lead_assignment_queue (tenant_id, lead_id, priority, status, queued_at)
+     SELECT l.tenant_id, l.id, 10, 'queued', NOW()
+     FROM leads l
+     WHERE l.tenant_id = $1 AND l.is_deleted = 0
+       AND l.assigned_to IS NULL
+       AND (l.assignment_status IS NULL OR l.assignment_status = 'unassigned')
+       AND NOT EXISTS (
+         SELECT 1 FROM lead_assignment_queue q
+         WHERE q.lead_id = l.id AND q.status IN ('queued', 'processing')
+       )
+     ORDER BY l.created_at ASC
+     LIMIT ${Math.max(1, Math.floor(Number(limit)) || 500)}`,
+    [tenantId],
+  );
+  return result.rowCount ?? result.affectedRows ?? 0;
+}
+
 async function updateQueueItem(id, patch) {
   const fields = [];
   const params = [id];
@@ -1944,6 +1969,7 @@ module.exports = {
   insertQueueItem,
   listQueue,
   getQueuedItems,
+  enqueueUnassignedLeads,
   updateQueueItem,
   markQueueAssigned,
   getAssignmentConfig,

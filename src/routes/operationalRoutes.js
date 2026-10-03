@@ -575,7 +575,7 @@ router.post("/assignment/schedule-assign", asyncRoute(async (req, res) => {
 }));
 
 router.post("/assignment/run-round-robin", asyncRoute(async (req, res) => {
-  const result = await processAssignmentQueue(tenant(req), { limit: req.body.limit, actor: actor(req) });
+  const result = await processAssignmentQueue(tenant(req), { limit: Number(req.body?.limit) || 500, actor: actor(req) });
   return ok(res, result);
 }));
 
