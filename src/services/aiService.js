@@ -27,6 +27,7 @@ const AI_SUMMARY_PENDING_TAG = "[AI SUMMARY PENDING]";
 const GPT_FAILED_MSG = "[GPT FAILED] AI summarization request failed — see server logs for details.";
 
 const SECTION_LABELS = {
+  keyHighlights: "KEY HIGHLIGHTS",
   callHeader: "CALL HEADER",
   discussionHighlights: "DISCUSSION HIGHLIGHTS & KEY REQUIREMENTS",
   qualificationsMet: "QUALIFICATIONS MET",
@@ -438,7 +439,10 @@ function buildSopGuidanceBlock(sop) {
  *  plain string as-is if the model didn't return the expected object shape. */
 function flattenSummaryForStorage(rawSummary) {
   if (rawSummary && typeof rawSummary === "object" && !Array.isArray(rawSummary)) {
-    return Object.entries(rawSummary)
+    // KEY HIGHLIGHTS always first, then the remaining sections in the order the model returned them.
+    const entries = Object.entries(rawSummary);
+    entries.sort(([a], [b]) => (a === "keyHighlights" ? -1 : 0) - (b === "keyHighlights" ? -1 : 0));
+    return entries
       .map(([k, v]) => `[${SECTION_LABELS[k] || k.toUpperCase()}]\n${typeof v === "object" ? JSON.stringify(v, null, 2) : v}`)
       .join("\n\n");
   }
@@ -588,7 +592,15 @@ LANGUAGE:
 ${sopGuidance.text}
 
 Generate:
-1. "summary": a JSON OBJECT (not a single string) with EXACTLY these four keys, each a detailed multi-line string in English. Use the sub-headings shown, with bullet points ("• ") under each; include every relevant detail from the call (requirements, prices quoted, packages, timelines, platforms, decision-maker info, etc.):
+1. "summary": a JSON OBJECT (not a single string) with EXACTLY these five keys, each a multi-line string in English. Use the sub-headings shown, with bullet points ("• ") under each; include every relevant detail from the call (requirements, prices quoted, packages, timelines, platforms, decision-maker info, etc.):
+   - "keyHighlights": the 5-6 MOST IMPORTANT points of the call for a busy sales manager, one per line, each EXACTLY in the form "• Label: value" (short value, with the exact figure/date). Use these labels, in this order, and skip a label only if it truly does not apply:
+       "• Customer: <customer name + company>"
+       "• Budget: <customer's budget in ₹, or "Not discussed">"
+       "• Offer / Price Quoted: <package/service and amount quoted incl. GST if said>"
+       "• Payment / Conversion: <amount paid / advance paid / converted status — write "Not paid yet" or "Not converted" if no payment happened>"
+       "• Purchase Timeline: <when the customer will decide or buy, as said on the call, or "Not discussed">"
+       "• Next Step: <the single most important follow-up with owner and date>"
+       Facts only from the transcript; never guess. No extra text outside these lines.
    - "callHeader":
        first line: Date: ${dateStr} | Time: ${timeStr} | Client: ${clientName} | Duration: ${durationStr}${sopGuidance.label ? ` | SOP: ${sopGuidance.label}` : ""}
        then "Call Summary:" — 3-5 lines describing the purpose of the call, what happened and the overall outcome.
@@ -617,6 +629,7 @@ Generate:
 Return JSON with exact keys:
 {
   "summary": {
+    "keyHighlights": "• Customer: ...\n• Budget: ...",
     "callHeader": "...",
     "discussionHighlights": "...",
     "qualificationsMet": "...",
