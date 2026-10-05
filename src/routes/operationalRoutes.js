@@ -360,6 +360,13 @@ router.get("/leads/:id", requireEmployeeOwnsLead(), asyncRoute(async (req, res) 
 
 router.put("/leads/:id", requireEmployeeOwnsLead(), asyncRoute(async (req, res) => {
   const patch = { ...req.body, lastActivityAt: new Date() };
+  // Keep temperature canonical (hot/warm/cold) so "Cold Lead" and "cold" never disagree.
+  if (typeof patch.temperature === "string") {
+    const t = patch.temperature.toLowerCase();
+    if (t.includes("hot")) patch.temperature = "hot";
+    else if (t.includes("cold")) patch.temperature = "cold";
+    else if (t.includes("warm")) patch.temperature = "warm";
+  }
   // UTM fields edited in Lead Details live in source_meta — merge them (non-empty only)
   // without dropping anything n8n stored there.
   const UTM_KEYS = ["utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content"];
