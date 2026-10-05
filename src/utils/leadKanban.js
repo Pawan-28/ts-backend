@@ -650,6 +650,7 @@ function getOppLeadsFromKanban(grouped = {}, category) {
 module.exports = {
   ADVANCED_KANBAN_STAGES,
   groupEmpLeadsKanban,
+  callKanbanColumn,
   groupKanbanSyncedWithCallyzer,
   resolveLeadKanbanColumn,
   aggregateOppCountsFromKanban,

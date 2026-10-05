@@ -1430,6 +1430,14 @@ router.post("/webhooks/callyzer", asyncRoute(async (req, res) => {
           notes: mapped.notes,
           aiSummary: mapped.aiSummary,
         });
+        // Auto pipeline: Lead -> Not Pick -> Short Call -> Conversation (forward-only, early funnel only)
+        if (mapped.leadId) {
+          await require("../services/autoPipelineStageService").applyCallToLeadStage({
+            tenantId,
+            leadId: mapped.leadId,
+            call: { direction: mapped.direction, outcome: mapped.outcome, durationSec: mapped.durationSec },
+          });
+        }
         // Fire AI MoM immediately for every call (real MoM if recording, "No recording" if not)
         if (savedCall?.id) {
           const { processCallWithAi } = require("../services/aiService");

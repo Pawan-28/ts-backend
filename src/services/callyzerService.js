@@ -691,6 +691,13 @@ async function getCallsForEmployee(tenantId, employee, { dbCalls = [], leads = [
               mapped.aiSummary || null,
             ]
           );
+          if (leadId) {
+            await require("./autoPipelineStageService").applyCallToLeadStage({
+              tenantId,
+              leadId,
+              call: { direction: mapped.direction, outcome: mapped.outcome, durationSec: mapped.durationSec },
+            });
+          }
           const newCallId = insertRes.insertId || insertRes.rows?.[0]?.id;
           if (newCallId) {
             const { processCallWithAi } = require("./aiService");
