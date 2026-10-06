@@ -8,23 +8,30 @@
  */
 const { APP_TZ_OFFSET } = require("./appTimezone");
 
-const LINK_KEYS = [
-  "meetLink", "meet_link", "meetingLink", "meeting_link", "meetingUrl", "meeting_url",
-  "google_meet_link", "googleMeetLink", "hangoutLink", "joinUrl", "join_url", "zoom_link", "zoomLink",
-];
+// Keys are compared case/space/underscore-insensitively ("Start Time" == start_time == startTime),
+// because n8n "Set" nodes often emit human-readable names like "Google Meet Link" / "Booked Date".
+const norm = (k) => String(k).toLowerCase().replace(/[^a-z0-9]/g, "");
+const keySet = (list) => list.map(norm);
+
+const LINK_KEYS = keySet([
+  "meetLink", "meetingLink", "meetingUrl", "meetUrl", "google_meet_link", "googleMeetLink",
+  "hangoutLink", "joinUrl", "zoomLink",
+]);
 // Full date-time first, then date-only, then time-only — order is the lookup priority.
-const DATETIME_KEYS = [
-  "scheduledAt", "scheduled_at", "meetingDateTime", "meeting_datetime", "meetingAt", "meeting_at",
-  "startAt", "start_at", "slot", "booking_datetime", "bookingDateTime",
-];
-const DATE_KEYS = [
-  "meetingDate", "meeting_date", "bookingDate", "booking_date", "appointmentDate", "appointment_date",
-  "slotDate", "slot_date",
-];
-const TIME_KEYS = [
-  "meetingTime", "meeting_time", "bookingTime", "booking_time", "appointmentTime", "appointment_time",
-  "slotTime", "slot_time", "startTime", "start_time",
-];
+// NOTE: deliberately no "booking time/date" — in n8n that is usually $now (when the booking was
+// MADE), not when the meeting happens.
+const DATETIME_KEYS = keySet([
+  "scheduledAt", "scheduled_at_utciso", "scheduledAtIso", "meetingDateTime", "meetingAt",
+  "startAt", "startDateTime", "appointmentDateTime", "slot",
+]);
+const DATE_KEYS = keySet([
+  "meetingDate", "bookedDate", "appointmentDate", "slotDate",
+]);
+const TIME_KEYS = keySet([
+  "meetingTime", "appointmentTime", "slotTime", "startTime",
+]);
+// Who the customer booked with (Amelia "provider") — used only when the lead has no assignee.
+const PROVIDER_KEYS = keySet(["assignedEmployee", "providerName", "provider", "employeeName", "employee"]);
 
 const TIME_ONLY = /^\s*\d{1,2}(?::\d{2})?(?::\d{2})?\s*(?:am|pm)?\s*$/i;
 const HAS_TZ = /(?:Z|[+-]\d{2}:?\d{2})$/i;
@@ -33,9 +40,15 @@ const pad2 = (n) => String(n).padStart(2, "0");
 
 function pick(sources, keys) {
   for (const src of sources) {
+    const byNorm = new Map();
+    for (const [k, v] of Object.entries(src)) {
+      if (v === undefined || v === null || typeof v === "object") continue;
+      if (String(v).trim() === "") continue;
+      const nk = norm(k);
+      if (!byNorm.has(nk)) byNorm.set(nk, v);
+    }
     for (const key of keys) {
-      const v = src[key];
-      if (v !== undefined && v !== null && String(v).trim() !== "") return v;
+      if (byNorm.has(key)) return byNorm.get(key);
     }
   }
   return undefined;
@@ -107,7 +120,7 @@ function parseDateValue(raw, clock) {
 }
 
 /**
- * @returns {null | { meetLink: string|null, scheduledAt: Date|null, rawTime: string|null }}
+ * @returns {null | { meetLink: string|null, scheduledAt: Date|null, rawTime: string|null, providerName: string|null }}
  *   null → payload carries no meeting at all. `scheduledAt: null` with a `rawTime` → the sender
  *   gave a time we couldn't parse (caller still creates the meeting and records the raw value).
  */
@@ -128,8 +141,11 @@ function extractWebhookMeeting(input) {
   const values = [full, dateVal, timeVal].filter((v) => v !== undefined);
   if (!meetLink && !values.length) return null;
 
-  const clockOnly = values.find((v) => typeof v !== "number" && TIME_ONLY.test(String(v)));
-  const dated = values.find((v) => !(typeof v !== "number" && TIME_ONLY.test(String(v))));
+  const isClock = (v) => typeof v !== "number" && TIME_ONLY.test(String(v));
+  const clockOnly = values.find(isClock);
+  const nonClock = values.filter((v) => !isClock(v));
+  // Prefer a value that already carries a time ("2026-10-07T14:00…") over a bare date.
+  const dated = nonClock.find((v) => typeof v === "number" || /\d{1,2}:\d{2}/.test(String(v))) ?? nonClock[0];
   const clock = clockOnly !== undefined ? parseClock(clockOnly) : null;
 
   let scheduledAt = null;
@@ -141,7 +157,8 @@ function extractWebhookMeeting(input) {
   }
 
   const rawTime = values.length ? values.map(String).join(" ").trim() : null;
-  return { meetLink, scheduledAt, rawTime };
+  const provider = pick(sources, PROVIDER_KEYS);
+  return { meetLink, scheduledAt, rawTime, providerName: provider ? String(provider).trim() : null };
 }
 
 module.exports = { extractWebhookMeeting, parseDateValue };

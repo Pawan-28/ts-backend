@@ -884,8 +884,18 @@ async function scheduleWebhookMeeting({ tenantId, input, lead, employeeId, servi
   const sched = extractWebhookMeeting(input);
   if (!sched) return null;
   try {
+    // Owner = the lead's assignee; if it has none yet, the provider the customer booked with.
+    if (!employeeId && sched.providerName) {
+      try {
+        const needle = sched.providerName.toLowerCase();
+        const emps = await repo.listActiveEmployees(tenantId);
+        employeeId = emps.find((e) => String(e.name || "").toLowerCase().includes(needle))?.id;
+      } catch (e) {
+        console.error("[webhookMeeting] provider lookup failed", e);
+      }
+    }
     if (!employeeId) {
-      console.warn(`[webhookMeeting] Lead #${lead?.id}: meeting in payload but lead has no assigned employee — not saved`, sched.rawTime || sched.meetLink);
+      console.warn(`[webhookMeeting] Lead #${lead?.id}: meeting in payload but no assigned employee / matching provider "${sched.providerName || ""}" — not saved`, sched.rawTime || sched.meetLink);
       return null;
     }
     let scheduledAt = sched.scheduledAt;
