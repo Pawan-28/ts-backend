@@ -1456,6 +1456,15 @@ async function insertMeeting(data) {
   return mapMeeting(result.rows[0]);
 }
 
+/** A non-cancelled meeting for this lead at exactly this time (webhook de-duplication). */
+async function findActiveMeetingAt(tenantId, leadId, scheduledAt) {
+  const result = await pool.query(
+    `SELECT * FROM meetings WHERE tenant_id = $1 AND lead_id = $2 AND scheduled_at = $3 AND status <> 'cancelled' LIMIT 1`,
+    [tenantId, leadId, scheduledAt],
+  );
+  return result.rows[0] ? mapMeeting(result.rows[0]) : null;
+}
+
 async function updateMeeting(tenantId, meetingId, patch) {
   // Plain scalar fields — only what's present in `patch` is touched, so an omitted
   // field (e.g. title during a scheduledAt-only reschedule) is left exactly as-is.
@@ -1980,6 +1989,7 @@ module.exports = {
   listEmployees,
   findEmployeeById,
   findServiceByIdCode,
+  findActiveMeetingAt,
   findSopByIdCode,
   createEmployee,
   updateEmployee,

@@ -12,7 +12,7 @@ function cleanServiceName(value) {
   const bracketed = text.match(/^\[Service:\s*([^\]]+)\]/i);
   if (bracketed) text = bracketed[1].trim();
   else {
-    const prefixed = text.match(/^Service:\s*(.+)$/im);
+    const prefixed = text.match(/^Service:\s*([^|\r\n]+)/im);
     if (prefixed) text = prefixed[1].trim();
   }
   return EMPTY_SERVICE_VALUES.has(text.toLowerCase()) ? "" : text;

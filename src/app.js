@@ -25,6 +25,7 @@ const app = express();
 
 const DEFAULT_FRONTEND_ORIGINS = [
   "https://ts-frontend-two.vercel.app",
+  "https://peru-whale-115627.hostingersite.com",
   "http://localhost:5173",
   "http://localhost:8080",
 ];

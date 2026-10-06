@@ -5,6 +5,7 @@ const { emitTenant, emitEmployee } = require("../realtime/socket");
 const { cacheGet, cacheSet } = require("../config/redis");
 const pool = require("../../config/db");
 const googleMeet = require("./googleMeetService");
+const { extractWebhookMeeting } = require("../utils/webhookMeeting");
 
 const { DEFAULT_TENANT_ID } = repo;
 
@@ -23,7 +24,9 @@ function actor(req) {
 
 function normalizeLeadInput(input = {}) {
   const name = input.leadName || input.lead_name || input.name || input.contactName;
-  const rawServices = input.services || input.service || input.serviceName || input.service_name || input.serviceTitle || input.service_title || input.serviceId || input.service_id || "";
+  // Service *name* only. A bare serviceId/SRV code is resolved to the catalog name in createLead
+  // (enrichedInput.service); using it here would store "Service: SRV-010" as the lead's service.
+  const rawServices = input.services || input.service || input.serviceName || input.service_name || input.serviceTitle || input.service_title || "";
   const servicesFormatted = Array.isArray(rawServices) ? rawServices.join(", ") : String(rawServices || "");
   
   const rawSop = input.sop || input.sopName || input.sop_name || input.sopTitle || input.sop_title || input.sopId || input.sop_id || "";
@@ -213,7 +216,10 @@ async function createLead(input, options = {}) {
     const rawCompany = input.companyName || input.company_name || input.company;
     const rawCity = input.city;
     const rawCountry = input.country;
-    const rawReqs = input.requirements || input.service || input.serviceName || input.service_name;
+    // A webhook that only carries serviceId/SRV code still has to update the lead's service.
+    const incomingServiceCode = input.serviceId || input.service_id;
+    const matchedService = incomingServiceCode ? await repo.findServiceByIdCode(tenantId, incomingServiceCode) : null;
+    const rawReqs = input.requirements || input.service || input.serviceName || input.service_name || matchedService?.name;
     const rawNotes = input.notes;
     const rawRev = input.expectedRevenue || input.expected_revenue || input.revenue;
     const rawWinProb = input.winProbability || input.win_probability;
@@ -230,6 +236,9 @@ async function createLead(input, options = {}) {
     patchField("requirements", rawReqs);
     patchField("notes", rawNotes);
     if (rawRev) patchField("expectedRevenue", Number(rawRev));
+    else if (matchedService && Number(matchedService.price_num) > 0 && !(Number(existingLead.expectedRevenue) > 0)) {
+      patchField("expectedRevenue", Number(matchedService.price_num));
+    }
     if (rawWinProb) patchField("winProbability", Number(rawWinProb));
     // NOTE: pipelineStage is intentionally NOT patched here. It is applied further
     // down via updateLeadStage(), the same canonical stage-transition mechanism used
@@ -300,36 +309,16 @@ async function createLead(input, options = {}) {
       }
     }
 
-    // Check if meeting is provided in payload -> Link meeting to existing lead & assigned employee
-    const meetLink = input.meetLink || input.meet_link || input.meetingLink || input.meeting_link || input.meeting_url || input.google_meet_link;
-    const meetingTime = input.scheduledAt || input.scheduled_at || input.meetingTime || input.meeting_time || input.meeting_date;
-    const serviceName = input.services || input.service || input.serviceName || input.service_name || rawReqs;
-
-    if (meetLink || meetingTime) {
-      try {
-        const getEmpId = (val) => (val && typeof val === "object" ? val.id || val._id : val);
-        const empId = getEmpId(updatedLead.assignedTo) || getEmpId(updatedLead.assigned_to) || getEmpId(existingLead.assignedTo) || getEmpId(existingLead.assigned_to);
-        if (empId) {
-          await createMeeting({
-            tenantId,
-            data: {
-              leadId: updatedLead.id,
-              employeeId: empId,
-              title: input.meetingTitle || input.meeting_title || buildClarityCallTitle(resolveCustomerName(updatedLead), serviceName),
-              scheduledAt: meetingTime ? new Date(meetingTime) : new Date(Date.now() + 3600 * 1000),
-              durationMin: Number(input.durationMin || input.duration_min || 30),
-              meetLink: meetLink || null,
-              location: meetLink ? "Google Meet" : (input.location || "Online"),
-              agenda: input.agenda || input.notes || `Initial discussion for ${updatedLead.leadName}`,
-              source: "lead",
-            },
-            actor: options.actor,
-          });
-        }
-      } catch (meetErr) {
-        console.error("[createLead] Auto create meeting error on existing lead:", meetErr);
-      }
-    }
+    // Customer-booked meeting in the payload -> save it on the lead's assigned employee so it shows on Meetings.
+    const getEmpId = (val) => (val && typeof val === "object" ? val.id || val._id : val);
+    await scheduleWebhookMeeting({
+      tenantId,
+      input,
+      lead: updatedLead,
+      employeeId: getEmpId(updatedLead.assignedTo) || getEmpId(updatedLead.assigned_to) || getEmpId(existingLead.assignedTo) || getEmpId(existingLead.assigned_to),
+      serviceName: input.services || input.service || input.serviceName || input.service_name || rawReqs,
+      actor: options.actor,
+    });
 
     await writeTimeline({
       tenantId,
@@ -399,6 +388,12 @@ async function createLead(input, options = {}) {
   };
 
   const normalized = normalizeLeadInput(enrichedInput);
+  // The sender gave no budget but the service has a catalog price → use the service price, so the
+  // pipeline card (e.g. ₹2.5L for a ₹2,50,000 service) matches the service it belongs to.
+  const servicePrice = Number(resolvedService?.price_num) || 0;
+  if (!(Number(normalized.expectedRevenue) > 0) && servicePrice > 0) {
+    normalized.expectedRevenue = servicePrice;
+  }
   // Store the canonical SOP code (e.g. SOP-007) + name, even when the sender passed a numeric id or a title.
   if (resolvedSop) {
     normalized.sourceMeta = {
@@ -538,35 +533,17 @@ async function createLead(input, options = {}) {
     }
   }
 
-  // Auto-schedule meeting if meeting link or meeting date is provided in payload
-  const meetLink = input.meetLink || input.meet_link || input.meetingLink || input.meeting_link || input.meeting_url || input.google_meet_link;
-  const meetingTime = input.scheduledAt || input.scheduled_at || input.meetingTime || input.meeting_time || input.meeting_date;
-  if (meetLink || meetingTime) {
-    try {
-      const getEmpId = (val) => (val && typeof val === "object" ? val.id || val._id : val);
-      const fetchedLead = await repo.findLeadById(tenantId, lead.id);
-      const empId = assignedEmployeeId || getEmpId(fetchedLead?.assignedTo) || getEmpId(fetchedLead?.assigned_to);
-      if (empId) {
-        await createMeeting({
-          tenantId,
-          data: {
-            leadId: lead.id,
-            employeeId: empId,
-            title: input.meetingTitle || input.meeting_title || buildClarityCallTitle(resolveCustomerName(lead), serviceName),
-            scheduledAt: meetingTime ? new Date(meetingTime) : new Date(Date.now() + 3600 * 1000),
-            durationMin: Number(input.durationMin || input.duration_min || 30),
-            meetLink: meetLink || null,
-            location: meetLink ? "Google Meet" : (input.location || "Online"),
-            agenda: input.agenda || input.notes || `Initial discussion for ${lead.leadName}`,
-            source: "lead",
-          },
-          actor: options.actor,
-        });
-      }
-    } catch (meetErr) {
-      console.error("[createLead] Auto create meeting error:", meetErr);
-    }
-  }
+  // Auto-schedule the customer's meeting if the payload carries a meeting link / date / time
+  const getEmpId = (val) => (val && typeof val === "object" ? val.id || val._id : val);
+  const fetchedLead = await repo.findLeadById(tenantId, lead.id);
+  await scheduleWebhookMeeting({
+    tenantId,
+    input,
+    lead,
+    employeeId: assignedEmployeeId || getEmpId(fetchedLead?.assignedTo) || getEmpId(fetchedLead?.assigned_to),
+    serviceName,
+    actor: options.actor,
+  });
 
   const finalLead = await repo.findLeadById(tenantId, lead.id, { populate: true });
   const resolvedLead = finalLead || lead;
@@ -896,6 +873,53 @@ async function completeFollowup({ tenantId, followupId, actor: a }) {
   }
   await writeTimeline({ tenantId, leadId: followup.leadId, type: "followup", summary: "Follow-up completed", payload: { followupId }, actor: a });
   return followup;
+}
+
+/**
+ * Save the meeting a customer booked themselves (form / n8n webhook payload) so it appears on the
+ * assigned employee's Meetings page. Never throws — a bad meeting block must not fail lead intake —
+ * but every skip is logged, because a silently missing meeting is exactly what reps notice.
+ */
+async function scheduleWebhookMeeting({ tenantId, input, lead, employeeId, serviceName, actor: a }) {
+  const sched = extractWebhookMeeting(input);
+  if (!sched) return null;
+  try {
+    if (!employeeId) {
+      console.warn(`[webhookMeeting] Lead #${lead?.id}: meeting in payload but lead has no assigned employee — not saved`, sched.rawTime || sched.meetLink);
+      return null;
+    }
+    let scheduledAt = sched.scheduledAt;
+    let agenda = input.agenda || input.notes || `Initial discussion for ${lead.leadName}`;
+    if (!scheduledAt) {
+      // Link without a time, or a time we couldn't parse: still save it (so the rep sees it) and keep the raw value.
+      console.warn(`[webhookMeeting] Lead #${lead.id}: could not read meeting time from "${sched.rawTime}" — saved for +1h`);
+      scheduledAt = new Date(Date.now() + 3600 * 1000);
+      if (sched.rawTime) agenda = `Customer requested slot: ${sched.rawTime}
+${agenda}`;
+    }
+    // Same lead + same slot already saved (webhook retry / lead updated again) → don't duplicate.
+    const existing = await repo.findActiveMeetingAt(tenantId, lead.id, scheduledAt);
+    if (existing) return existing;
+
+    return await createMeeting({
+      tenantId,
+      data: {
+        leadId: lead.id,
+        employeeId,
+        title: input.meetingTitle || input.meeting_title || buildClarityCallTitle(resolveCustomerName(lead), serviceName),
+        scheduledAt,
+        durationMin: Number(input.durationMin || input.duration_min || 30),
+        meetLink: sched.meetLink || null,
+        location: sched.meetLink ? "Google Meet" : (input.location || "Online"),
+        agenda,
+        source: "lead",
+      },
+      actor: a,
+    });
+  } catch (err) {
+    console.error(`[webhookMeeting] Lead #${lead?.id}: failed to save meeting`, err);
+    return null;
+  }
 }
 
 async function createMeeting({ tenantId, data, actor: a }) {
