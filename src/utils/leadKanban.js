@@ -7,7 +7,7 @@ const {
   parseCallDurationSeconds,
 } = require("./callMetrics");
 const { mapStageToId, PIPELINE_STAGE_DEFINITIONS } = require("./pipelineStages");
-const { isDateKeyInPeriod, localDateKey } = require("./periodDateKeys");
+const { isDateKeyInPeriod, isMeetingDateKeyInPeriod, localDateKey } = require("./periodDateKeys");
 
 const ADVANCED_KANBAN_STAGES = new Set([
   "meeting_booked",
@@ -265,7 +265,7 @@ function filterMeetingsForPeriod(meetings = [], period = "month", now = new Date
     if (p === "custom" && customRange?.startDate && customRange?.endDate) {
       return key && key >= customRange.startDate && key <= customRange.endDate;
     }
-    return isDateKeyInPeriod(key, period, now);
+    return isMeetingDateKeyInPeriod(key, period, now);
   });
 }
 

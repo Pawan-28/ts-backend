@@ -33,7 +33,7 @@ const {
   resolveCustomerName,
   resolveLeadServiceName,
 } = require("../utils/meetingTitle");
-const { isDateKeyInPeriod, localDateKey: periodLocalDateKey } = require("../utils/periodDateKeys");
+const { isDateKeyInPeriod, isMeetingDateKeyInPeriod, localDateKey: periodLocalDateKey } = require("../utils/periodDateKeys");
 const { requirePg } = require("../middleware/pgReady");
 const {
   isAdminUser,
@@ -964,7 +964,7 @@ router.get("/employee/:employeeId/pipeline/board", requireEmployeeSelf(), asyncR
       const rawStr = String(raw);
       // Naive "YYYY-MM-DD[T ]HH:mm:ss" (toLocalSqlString) is already IST wall-clock.
       const key = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?$/.test(rawStr) ? rawStr.slice(0, 10) : periodLocalDateKey(new Date(rawStr));
-      return isDateKeyInPeriod(key, period, new Date(), customRange);
+      return isMeetingDateKeyInPeriod(key, period, new Date(), customRange);
     });
     payload.totals = { ...(payload.totals || {}), meetings: payload.meetings.length };
   }
