@@ -6,7 +6,7 @@ const xlsx = require("xlsx");
 const repo = require("../repositories/operationalRepo");
 const privateContactsRepo = require("../repositories/privateContactsRepo");
 const privateContactsController = require("../controllers/privateContactsController");
-const { listAllSops } = require("../controllers/sopController");
+const { listAllSops, filterSopsForViewer } = require("../controllers/sopController");
 const {
   validate,
   createLeadSchema,
@@ -26,6 +26,7 @@ const {
 } = require("../validators/operationalSchemas");
 const pool = require("../../config/db");
 const { queryCallStats } = require("../utils/employeeCallStats");
+const { callSqlExprs } = require("../utils/callMetrics");
 const { isValidDateKey } = require("../utils/periodFilter");
 const {
   buildClarityCallTitle,
@@ -641,7 +642,7 @@ router.post("/employees/:employeeId/private-contacts", requireEmployeeSelf("empl
 router.delete("/employees/:employeeId/private-contacts/:id", requireEmployeeSelf("employeeId"), privateContactsController.removePrivateContact);
 
 router.get("/sops", asyncRoute(async (req, res) => {
-  const sops = await listAllSops();
+  const sops = filterSopsForViewer(await listAllSops(), req);
   return ok(res, sops);
 }));
 
@@ -661,7 +662,7 @@ async function loadEmployeeDashboard(tenantId, employeeId, { syncCallyzer = fals
     repo.listFollowups(tenantId, employeeId),
     repo.listCalls(tenantId, employeeId),
     repo.listMeetings(tenantId, employeeId),
-    listAllSops().catch(() => []),
+    listAllSops().then((all) => filterSopsForViewer(all, { user: { role: "employee" } })).catch(() => []),
   ]);
   const leads = leadsResult.items;
   let calls = formatDbCallsForEmployee(dbCalls.slice(0, 500), leads);
@@ -834,11 +835,33 @@ router.post("/employee/callyzer/start-call", requireEmployeeSelfBody("employeeId
   });
 }));
 
+/**
+ * period=custom -> { startDate, endDate } (validated, From <= To). Any other period -> null.
+ * Invalid custom input sends the 400 itself and returns false (caller must `return`).
+ */
+function parseCustomRangeQuery(req, res, period) {
+  if (period !== "custom") return null;
+  const startDate = String(req.query.startDate || "");
+  const endDate = String(req.query.endDate || "");
+  if (!isValidDateKey(startDate) || !isValidDateKey(endDate)) {
+    res.status(400).json({ success: false, message: "Custom range needs startDate and endDate as YYYY-MM-DD" });
+    return false;
+  }
+  if (startDate > endDate) {
+    res.status(400).json({ success: false, message: "From Date must be on or before To Date" });
+    return false;
+  }
+  return { startDate, endDate };
+}
+
 router.get("/employee/:employeeId/calls", requireEmployeeSelf(), asyncRoute(async (req, res) => {
   const tenantId = tenant(req);
   const employeeId = req.params.employeeId;
   const period = String(req.query.period || "all").toLowerCase();
   const limit = Number(req.query.limit) || Number(process.env.EMPLOYEE_CALLS_MAX || 10000);
+  // period=custom needs startDate/endDate (YYYY-MM-DD, inclusive) - used by the employee Yesterday / Custom filters.
+  const customRange = parseCustomRangeQuery(req, res, period);
+  if (customRange === false) return;
   const [employee, leadsResult] = await Promise.all([
     repo.findEmployeeById(tenantId, employeeId),
     repo.listAllLeads(tenantId, { assignedTo: employeeId }),
@@ -855,9 +878,9 @@ router.get("/employee/:employeeId/calls", requireEmployeeSelf(), asyncRoute(asyn
     });
   }
 
-  const dbCalls = await repo.listCalls(tenantId, employeeId, { period, limit });
+  const dbCalls = await repo.listCalls(tenantId, employeeId, { period, limit, ...(customRange || {}) });
   const calls = formatDbCallsForEmployee(dbCalls, leads);
-  return ok(res, calls, { total: calls.length, period: period === "all" ? null : period });
+  return ok(res, calls, { total: calls.length, period: period === "all" ? null : period, ...(customRange || {}) });
 }));
 
 router.get("/pipeline/board", asyncRoute(async (req, res) => {
@@ -910,6 +933,27 @@ router.get("/pipeline/board", asyncRoute(async (req, res) => {
     endDate,
   });
   return ok(res, payload, { syncedAt: new Date().toISOString() });
+}));
+
+/**
+ * Lead tiles for ONE employee (Employee Dashboard + Employee Pipeline summary row): same lead universe,
+ * period handling and definitions as the admin Dashboard tiles (leads created in the period), scoped to the
+ * employee's assigned leads. period=today|week|month|custom [&startDate&endDate].
+ */
+router.get("/employee/:employeeId/lead-summary", requireEmployeeSelf(), asyncRoute(async (req, res) => {
+  const period = String(req.query.period || "month").toLowerCase();
+  if (!["today", "day", "week", "month", "custom", "all"].includes(period)) {
+    return res.status(400).json({ success: false, message: `Invalid period "${period}"` });
+  }
+  if (period === "custom" && (!isValidDateKey(String(req.query.startDate || "")) || !isValidDateKey(String(req.query.endDate || "")))) {
+    return res.status(400).json({ success: false, message: "Custom range needs startDate and endDate as YYYY-MM-DD" });
+  }
+  const data = await require("../services/dashboardMetricsService").getLeadSummary(
+    tenant(req),
+    { period, startDate: req.query.startDate, endDate: req.query.endDate },
+    { employeeId: req.params.employeeId, service: req.query.service },
+  );
+  return res.json({ success: true, ...data });
 }));
 
 router.get("/employee/:employeeId/pipeline/board", requireEmployeeSelf(), asyncRoute(async (req, res) => {
@@ -993,10 +1037,7 @@ router.get("/employee/:employeeId/pipeline/board", requireEmployeeSelf(), asyncR
        FROM employee_calls ec
        WHERE ec.tenant_id = $1
          AND ec.lead_id IN (SELECT l.id FROM leads l WHERE l.tenant_id = $1 AND l.assigned_to = $2 AND l.is_deleted = 0)
-         AND (
-           LOWER(COALESCE(ec.direction, '')) IN ('outbound', 'out', 'outgoing')
-           OR LOWER(COALESCE(ec.outcome, '')) REGEXP 'not connected|not pick|rejected|no answer|busy|unanswered|not answered'
-         )
+         AND ${callSqlExprs("ec").outbound}
        GROUP BY ec.lead_id`,
       [tenantId, employeeId],
     );
@@ -1076,6 +1117,9 @@ router.get("/employee/:employeeId/callyzer/stats", requireEmployeeSelf(), asyncR
   const month = req.query.month; // e.g. "2026-07"
   const period = String(req.query.period || "today").toLowerCase();
   const shouldSync = req.query.sync !== "0";
+  // period=custom needs startDate/endDate (YYYY-MM-DD, inclusive) - used by the employee Yesterday / Custom filters.
+  const customRange = parseCustomRangeQuery(req, res, period);
+  if (customRange === false) return;
 
   let synced = false;
   if (shouldSync && callyzer.isConfigured()) {
@@ -1094,7 +1138,7 @@ router.get("/employee/:employeeId/callyzer/stats", requireEmployeeSelf(), asyncR
     }
   }
 
-  const stats = await queryCallStats(pool, { tenantId, employeeId, period, month });
+  const stats = await queryCallStats(pool, { tenantId, employeeId, period, month, ...(customRange || {}) });
 
   return ok(res, {
     success: true,
@@ -1103,6 +1147,7 @@ router.get("/employee/:employeeId/callyzer/stats", requireEmployeeSelf(), asyncR
     syncedAt: new Date().toISOString(),
     stats,
     period: month || period,
+    ...(customRange || {}),
   });
 }));
 

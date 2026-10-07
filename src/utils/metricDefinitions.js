@@ -13,7 +13,7 @@
  */
 const { mapLeadKanbanStage } = require("./leadStats");
 const { getStageLabelById } = require("./pipelineStages");
-const { CALL_CONVERSATION_MIN_SEC } = require("./callMetrics");
+const { CALL_CONVERSATION_MIN_SEC, callSqlExprs, pickupRatePct } = require("./callMetrics");
 const { isValidDateKey } = require("./periodFilter");
 
 /* ───────────────────────────── Period ───────────────────────────── */
@@ -198,13 +198,14 @@ function summarizeLeadUniverse(rows = []) {
 /* ───────────────────────────── Rates ───────────────────────────── */
 
 /**
- * Pickup = answered outbound calls / dialled outbound calls (period).
+ * Pickup = answered OUTBOUND calls (Conversation + Short) / OUTBOUND dials (period) - the one shared
+ *          definition (utils/callMetrics.js pickupRatePct); no other pickup calculation exists.
  * Qualification = leads that reached a 2 min+ conversation or a booked meeting / total leads (period).
  * Conversion = payment-complete leads / total leads (period).
  */
 function computeRates({ summary, calls }) {
   return {
-    pickup: pct(Number(calls?.answered_outbound) || 0, Number(calls?.outbound_calls) || 0),
+    pickup: pickupRatePct(calls?.answered_outbound, calls?.outbound_calls),
     qualification: pct(summary.qualified, summary.total),
     conversion: pct(summary.closed, summary.total),
   };
@@ -224,10 +225,15 @@ function compareLeaderboard(a, b) {
 
 /* ───────────────────────────── SQL fragments ───────────────────────────── */
 
-const OUTBOUND_CALL_SQL = (alias = "") => `LOWER(${alias ? `${alias}.` : ""}direction) IN ('out', 'outbound', 'outgoing')`;
-const ANSWERED_CALL_SQL = (alias = "") => `${alias ? `${alias}.` : ""}duration_sec > 0`;
-const CONVERSATION_CALL_SQL = (alias = "") =>
-  `${alias ? `${alias}.` : ""}duration_sec >= ${CALL_CONVERSATION_MIN_SEC}`;
+// All fragments come from the shared call classification (utils/callMetrics.js callSqlExprs):
+//   OUTBOUND = outbound dials (outbound direction + unanswered dials legacy-tagged inbound)
+//   ANSWERED = connected (Conversation + Short + Incoming short), any direction
+//   ANSWERED_OUTBOUND = Conversation/Short with outbound direction (the pickup-rate numerator)
+//   CONVERSATION = answered, talk >= 2 min, any direction
+const OUTBOUND_CALL_SQL = (alias = "") => callSqlExprs(alias).outbound;
+const ANSWERED_CALL_SQL = (alias = "") => callSqlExprs(alias).connected;
+const ANSWERED_OUTBOUND_CALL_SQL = (alias = "") => callSqlExprs(alias).connectedOutbound;
+const CONVERSATION_CALL_SQL = (alias = "") => callSqlExprs(alias).conversation;
 
 /* ───────────────────────────── Human-readable definitions ───────────────────────────── */
 
@@ -259,7 +265,7 @@ function buildDefinitions(period) {
     },
     totalCalls: {
       label: "Total Calls",
-      formula: "All logged calls (inbound + outbound)",
+      formula: "All logged calls = Conversation (2 min+) + Short call (< 2 min) + Incoming short (< 2 min) + Not pick + Rejected + Missed (incoming)",
       basis: `Call date within ${basis}`,
     },
     qualifiedLeads: {
@@ -279,7 +285,7 @@ function buildDefinitions(period) {
     },
     pickup: {
       label: "Pickup Rate",
-      formula: "Answered outbound calls / dialled outbound calls",
+      formula: "Answered outbound calls (Conversation + Short call) / outbound dials (answered + Not pick + Rejected)",
       basis: `Call date within ${basis}`,
     },
     qualification: {
@@ -315,6 +321,7 @@ module.exports = {
   CALL_CONVERSATION_MIN_SEC,
   OUTBOUND_CALL_SQL,
   ANSWERED_CALL_SQL,
+  ANSWERED_OUTBOUND_CALL_SQL,
   CONVERSATION_CALL_SQL,
   normalizePeriodKey,
   resolvePeriod,

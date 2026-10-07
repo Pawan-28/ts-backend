@@ -1,6 +1,7 @@
 require("dotenv").config();
 const pool = require("./config/db");
 const { processCallWithAi } = require("./src/services/aiService");
+const { shouldGenerateAiSummary } = require("./src/utils/callMetrics");
 
 const TENANT_ID = process.env.DEFAULT_TENANT_ID || "default";
 
@@ -8,9 +9,10 @@ async function processAllPending() {
   console.log("Finding calls with recordings but no real AI summary...");
 
   const pending = await pool.query(`
-    SELECT id, outcome, duration_sec, recording_url, ai_summary
+    SELECT id, outcome, direction, duration_sec, recording_url, transcript, ai_summary
     FROM employee_calls
     WHERE recording_url IS NOT NULL AND recording_url <> ''
+      AND duration_sec > 0
       AND (
         ai_summary IS NULL OR ai_summary = ''
         OR ai_summary LIKE '%No call recording%'
@@ -28,6 +30,10 @@ async function processAllPending() {
   let failed = 0;
 
   for (const row of pending.rows) {
+    if (!shouldGenerateAiSummary(row)) {
+      console.log(`Skipping call ID ${row.id} (${row.outcome}, ${row.duration_sec}s) - call did not connect, no AI summary.`);
+      continue;
+    }
     try {
       console.log(`Processing call ID ${row.id} (${row.outcome}, ${row.duration_sec}s, recording present)...`);
       await processCallWithAi(TENANT_ID, row.id);

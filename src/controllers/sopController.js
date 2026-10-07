@@ -225,10 +225,22 @@ async function listAllSops() {
     }));
 }
 
+// Employees only see published (Active/Published) playbooks; admins keep seeing drafts/review/archived.
+const EMPLOYEE_VISIBLE_SOP_STATUSES = new Set(["active", "published"]);
+
+function isEmployeeVisibleSopRow(sop) {
+  return EMPLOYEE_VISIBLE_SOP_STATUSES.has(String(sop?.status || "").trim().toLowerCase());
+}
+
+function filterSopsForViewer(sops, req) {
+  const list = Array.isArray(sops) ? sops : [];
+  return req?.user?.role === "employee" ? list.filter(isEmployeeVisibleSopRow) : list;
+}
+
 // ALL SOPS
 const getAllSops = async (req, res) => {
   try {
-    const sops = await listAllSops();
+    const sops = filterSopsForViewer(await listAllSops(), req);
     res.json({ success: true, sops });
   } catch (error) {
     console.error("Error fetching SOPs:", error);
@@ -241,7 +253,7 @@ const getSopDetails = async (req, res) => {
   try {
     const { id } = req.params;
     const sop = await fetchSopById(id);
-    if (!sop) {
+    if (!sop || (req.user?.role === "employee" && !isEmployeeVisibleSopRow(sop))) {
       return res.status(404).json({ success: false, message: "SOP not found" });
     }
     res.json({ success: true, sop });
@@ -682,6 +694,7 @@ const generateSopAiController = async (req, res) => {
 
 module.exports = {
   listAllSops,
+  filterSopsForViewer,
   getAllSops,
   getSopDetails,
   createSop,

@@ -22,10 +22,15 @@ function getStageLabelById(stageId) {
   return meta ? meta.label : DEFAULT_PIPELINE_STAGE_LABEL;
 }
 
+// Legacy workflow labels, compared AFTER normalising (lower-case, "_" and "-" -> space, spaces collapsed).
+const LEAD_LABELS = new Set(["not contacted", "uncontacted", "un contacted", "unqualified", "un qualified", "not qualified"]);
+const CONVERSATION_LABELS = new Set(["contacted", "qualified"]);
+const NOT_PICK_LABELS = new Set(["attempted"]);
+
 function mapStageToId(stage, status = "") {
   const raw = String(stage || "").trim();
   const s = raw.toLowerCase();
-  const normalized = s.replace(/_/g, " ");
+  const normalized = s.replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
   const st = String(status || "").toLowerCase();
 
   if (s === "conversation_5") return "conversation_2min";
@@ -37,6 +42,13 @@ function mapStageToId(stage, status = "") {
       || item.label.toLowerCase() === normalized,
   );
   if (direct) return direct.id;
+
+  // Exact (normalised) matches for the legacy workflow labels - NOT substring checks, so "Not Contacted" and
+  // "Un-Qualified" can never be mistaken for "Contacted" / "Qualified".
+  //   Contacted -> Conversation · Qualified -> Conversation · Attempted -> Not Pick · Not Contacted -> Lead
+  if (LEAD_LABELS.has(normalized)) return "lead";
+  if (CONVERSATION_LABELS.has(normalized)) return "conversation_2min";
+  if (NOT_PICK_LABELS.has(normalized)) return "not_pick";
 
   if (normalized.includes("not interested") || st === "ni" || st.includes("not interested")) {
     return "not_interested";
@@ -75,8 +87,6 @@ function mapStageToId(stage, status = "") {
     || normalized.includes("follow up")
     || normalized.includes("follow-up")
     || normalized === "conversation"
-    || s.includes("contacted")
-    || s.includes("qualified")
   ) {
     return "conversation_2min";
   }
@@ -84,13 +94,13 @@ function mapStageToId(stage, status = "") {
     s === "short_call"
     || normalized.includes("short call")
     || (normalized.includes("connected") && normalized.includes("2 min"))
-    || s.includes("attempted")
   ) {
     return "short_call";
   }
   if (normalized.includes("not pick") || st === "notpick" || st.includes("not pick")) {
     return "not_pick";
   }
+  if (st === "attempted") return "not_pick";
   if (s === "new" || s.includes("new lead") || st === "new" || st.includes("new lead")) {
     return "lead";
   }
@@ -99,8 +109,6 @@ function mapStageToId(stage, status = "") {
   if (s === "closed_won") return "payment_complete";
   if (s === "negotiation") return "objection";
   if (s === "proposal") return "proposal_sent";
-  if (s === "qualified") return "meeting_booked";
-  if (s === "contacted") return "conversation_2min";
 
   return DEFAULT_PIPELINE_STAGE_ID;
 }

@@ -8,6 +8,10 @@ async function runRahulAiProcessing() {
     try {
       console.log(`Processing call ID ${id}...`);
       const updated = await processCallWithAi("default", id);
+      if (updated.skipped) {
+        console.log(`Call ID ${id} skipped: ${updated.skipReason}`);
+        continue;
+      }
       console.log(`Call ID ${id} processed successfully:`);
       console.log("  Outcome:", updated.outcome);
       console.log("  AI Summary length:", updated.ai_summary?.length);

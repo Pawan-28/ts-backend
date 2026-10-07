@@ -1,6 +1,6 @@
 const { logger } = require("../config/logger");
 const pool = require("../../config/db");
-const { CALL_CONVERSATION_MIN_SEC } = require("../utils/callMetrics");
+const { CALL_CONVERSATION_MIN_SEC, shouldGenerateAiSummary } = require("../utils/callMetrics");
 const { formatUtcInstantAsAppSql, parseCallyzerCallInstant } = require("../utils/appTimezone");
 const privateContactsRepo = require("../repositories/privateContactsRepo");
 const { toIndianMobile10, toCallyzerNumber } = require("../utils/phone");
@@ -734,9 +734,11 @@ async function getCallsForEmployee(tenantId, employee, { dbCalls = [], leads = [
           if (log.call_recording_url && !dbCall.recordingUrl) {
             dbCall.recordingUrl = log.call_recording_url;
             try {
-              const placeholder = !dbCall.aiSummary
-                || /No call recording|AI UNAVAILABLE|TRANSCRIPT UNAVAILABLE/i.test(String(dbCall.aiSummary))
-                || /No call recording/i.test(String(dbCall.notes || ""));
+              // Never wipe/regenerate the summary of a call that did not connect (no AI for missed calls).
+              const placeholder = shouldGenerateAiSummary({ ...dbCall, recordingUrl: log.call_recording_url })
+                && (!dbCall.aiSummary
+                  || /No call recording|AI UNAVAILABLE|TRANSCRIPT UNAVAILABLE/i.test(String(dbCall.aiSummary))
+                  || /No call recording/i.test(String(dbCall.notes || "")));
               await pool.query(
                 placeholder
                   ? "UPDATE employee_calls SET recording_url = $1, ai_summary = NULL, notes = NULL, transcript = NULL WHERE tenant_id = $2 AND callyzer_call_id = $3"

@@ -1,10 +1,9 @@
 const {
-  isConversationCall,
+  callBucket,
   isNotPickupByClientCall,
   isOutboundCall,
   isShortConnectedCall,
   phonesMatchLoose,
-  parseCallDurationSeconds,
 } = require("./callMetrics");
 const { mapStageToId, PIPELINE_STAGE_DEFINITIONS } = require("./pipelineStages");
 const { isDateKeyInPeriod, isMeetingDateKeyInPeriod, localDateKey } = require("./periodDateKeys");
@@ -201,11 +200,15 @@ function isUncontactedNewLead(lead, periodCalls = [], options = {}) {
   return isEmployeeNewAssignedLead(lead);
 }
 
+// Pipeline column rules = the shared call definitions (utils/callMetrics.js):
+//   Conversation = answered, >= 2 min, any direction
+//   Short Call   = answered OUTBOUND < 2 min
+//   Not Pick     = OUTBOUND call the client did not answer (Rejected is NOT Not Pick)
+// Rejected, Missed (incoming) and Incoming short calls never create a Not Pick / Short Call card.
 function leadHasConversation2MinPlus(calls = [], { outboundOnly = false } = {}) {
   return calls.some((c) => {
     if (outboundOnly && !isOutboundCall(c)) return false;
-    const sec = Number.isFinite(c.durationSec) ? c.durationSec : parseCallDurationSeconds(c.duration);
-    return isConversationCall(sec);
+    return callBucket(c) === "conversation";
   });
 }
 
@@ -244,14 +247,12 @@ function resolveEarlyFunnelColumn(lead, periodCalls = [], options = {}) {
 }
 
 function callKanbanColumn(call) {
-  const sec = Number.isFinite(call?.durationSec)
-    ? call.durationSec
-    : parseCallDurationSeconds(call?.duration);
-  if (isConversationCall(sec)) return "conversation_2min";
-  if (!isOutboundCall(call)) return null;
-  if (isNotPickupByClientCall(call)) return "not_pick";
-  if (isShortConnectedCall(call)) return "short_call";
-  return null;
+  switch (callBucket(call || {})) {
+    case "conversation": return "conversation_2min";
+    case "short": return "short_call";
+    case "no_pickup": return "not_pick";
+    default: return null; // rejected / missed incoming / incoming short: no stage move
+  }
 }
 
 function filterMeetingsForPeriod(meetings = [], period = "month", now = new Date(), customRange = null) {

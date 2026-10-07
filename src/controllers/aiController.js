@@ -47,6 +47,14 @@ const processCallAi = async (req, res) => {
       return res.status(400).json({ success: false, message: "callId is required" });
     }
     const updatedCall = await processCallWithAi(tenantId, callId);
+    if (updatedCall?.skipped) {
+      // Calls that never connected (or have nothing to summarize) get no AI MoM — refuse politely.
+      return res.status(422).json({
+        success: false,
+        skipped: true,
+        message: updatedCall.skipReason || "No AI summary is generated for calls that did not connect.",
+      });
+    }
     res.json({ success: true, call: updatedCall });
   } catch (err) {
     res.status(err.status || 500).json({ success: false, message: err.message });

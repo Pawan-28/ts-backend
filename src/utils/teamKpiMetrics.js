@@ -39,7 +39,9 @@ function computeServiceMetrics(callStats = {}, leadRow = {}) {
     responseTimeMin: callStats.avgDurationSec > 0
       ? Number((callStats.avgDurationSec / 60).toFixed(1))
       : null,
-    pickupRate: pct(Number(callStats.connectedCalls) || 0, totalCalls),
+    // ONE pickup definition (utils/callMetrics.js pickupRatePct): answered outbound / outbound dials.
+    // callStats.pickupRate comes from mapCallStatsRow; null when nothing was dialled.
+    pickupRate: (Number(callStats.outgoingCalls) || 0) > 0 ? Number(callStats.pickupRate) || 0 : null,
     qualificationRate: pct(qualifiedLeads, totalLeads),
     objectionHandling: totalLeads > 0 ? Math.min(99, Math.round((objectionLeads / totalLeads) * 100)) : null,
     conversionRate: pct(convertedLeads, totalLeads),

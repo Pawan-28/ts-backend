@@ -1,5 +1,5 @@
 const pool = require("../../config/db");
-const { CALL_CONVERSATION_MIN_SEC } = require("../utils/callMetrics");
+const { callSqlExprs, pickupRatePct } = require("../utils/callMetrics");
 const {
   buildPeriodDateFilter,
   buildCustomDateFilter,
@@ -205,9 +205,13 @@ const getEmployees = async (req, res) => {
           SELECT COUNT(*) FROM employee_calls ec WHERE ec.employee_id = e.id
         ), 0) AS total_calls,
         COALESCE((
-          SELECT COUNT(*) FROM employee_calls ec 
-          WHERE ec.employee_id = e.id AND (ec.duration_sec > 0 OR LOWER(COALESCE(ec.outcome, '')) IN ('connected', 'picked_up', 'answered'))
+          SELECT COUNT(*) FROM employee_calls ec
+          WHERE ec.employee_id = e.id AND ${callSqlExprs("ec").connectedOutbound}
         ), 0) AS pickup_calls,
+        COALESCE((
+          SELECT COUNT(*) FROM employee_calls ec
+          WHERE ec.employee_id = e.id AND ${callSqlExprs("ec").outbound}
+        ), 0) AS outbound_calls,
         COALESCE((
           SELECT COUNT(*) FROM meetings m WHERE m.employee_id = e.id
         ), 0) + (
@@ -414,9 +418,11 @@ const getEmployeeDetails = async (req, res) => {
     const callsResult = await pool.query(
       `SELECT
          COUNT(*) AS total_calls,
-         SUM(CASE WHEN duration_sec >= ${CALL_CONVERSATION_MIN_SEC} THEN 1 ELSE 0 END) AS conversations_5min_plus,
-         SUM(CASE WHEN duration_sec > 0 THEN 1 ELSE 0 END) AS connected_calls,
-         AVG(CASE WHEN duration_sec > 0 THEN duration_sec END) AS avg_connected_sec
+         SUM(CASE WHEN ${callSqlExprs("").conversation} THEN 1 ELSE 0 END) AS conversations_5min_plus,
+         SUM(CASE WHEN ${callSqlExprs("").connected} THEN 1 ELSE 0 END) AS connected_calls,
+         SUM(CASE WHEN ${callSqlExprs("").outbound} THEN 1 ELSE 0 END) AS outbound_calls,
+         SUM(CASE WHEN ${callSqlExprs("").connectedOutbound} THEN 1 ELSE 0 END) AS answered_outbound_calls,
+         AVG(CASE WHEN ${callSqlExprs("").connected} THEN duration_sec END) AS avg_connected_sec
        FROM employee_calls
        WHERE tenant_id = 'default' AND employee_id = $1`,
       [id],
@@ -424,11 +430,9 @@ const getEmployeeDetails = async (req, res) => {
     const callsRow = callsResult.rows[0] || {};
     const conversations5Min = Number(callsRow.conversations_5min_plus) || 0;
     const totalCalls = Number(callsRow.total_calls) || 0;
-    const connectedCalls = Number(callsRow.connected_calls) || 0;
     const avgConnectedSec = Number(callsRow.avg_connected_sec) || 0;
-    const callPickupRate = totalCalls > 0
-      ? Math.min(100, Math.round((connectedCalls / totalCalls) * 100))
-      : 0;
+    // ONE pickup definition: answered outbound / outbound dials (utils/callMetrics.js pickupRatePct).
+    const callPickupRate = pickupRatePct(callsRow.answered_outbound_calls, callsRow.outbound_calls);
 
     const cashRecordsResult = await pool.query(
       `SELECT cc.*, l.lead_name, l.company_name

@@ -30,7 +30,7 @@ function periodClause(period, column, params) {
  * dateMode "created"  -> leads created in the period (default: Total Leads, funnel, tiles, leaderboard)
  * dateMode "activity" -> leads touched in the period (AI insights)
  */
-async function loadLeadUniverse(tenantId, period, { service, employee, dateMode = "created" } = {}) {
+async function loadLeadUniverse(tenantId, period, { service, employee, employeeId, dateMode = "created" } = {}) {
   const params = [tenantId];
   const where = [
     "(l.tenant_id = $1 OR l.tenant_id IS NULL)",
@@ -42,6 +42,10 @@ async function loadLeadUniverse(tenantId, period, { service, employee, dateMode 
     params.push(`%${service}%`);
     const idx = params.length;
     where.push(`(l.form_name LIKE $${idx} OR l.keyword LIKE $${idx} OR l.source LIKE $${idx} OR l.requirements LIKE $${idx})`);
+  }
+  if (employeeId != null && employeeId !== "") {
+    params.push(employeeId);
+    where.push(`l.assigned_to = $${params.length}`);
   }
   if (employee && employee !== "All Employees") {
     params.push(employee);
@@ -60,7 +64,7 @@ async function loadLeadUniverse(tenantId, period, { service, employee, dateMode 
             COALESCE(NULLIF(TRIM(l.company_name), ''), '') AS company_name,
             e.name AS assigned_employee,
             EXISTS (SELECT 1 FROM meetings m WHERE m.lead_id = l.id AND LOWER(COALESCE(m.status, '')) <> 'cancelled') AS has_meeting,
-            EXISTS (SELECT 1 FROM employee_calls ec WHERE ec.lead_id = l.id AND ${M.OUTBOUND_CALL_SQL("ec")}
+            EXISTS (SELECT 1 FROM employee_calls ec WHERE ec.lead_id = l.id
                     AND ${M.CONVERSATION_CALL_SQL("ec")}) AS has_conversation
      FROM leads l
      LEFT JOIN employees e ON e.id = l.assigned_to
@@ -78,10 +82,10 @@ async function queryCallStats(tenantId, period) {
   const out = M.OUTBOUND_CALL_SQL();
   const { rows } = await pool.query(
     `SELECT COUNT(*) AS total_calls,
-            SUM(CASE WHEN duration_sec > 0 THEN 1 ELSE 0 END) AS connected_calls,
+            SUM(CASE WHEN ${M.ANSWERED_CALL_SQL()} THEN 1 ELSE 0 END) AS connected_calls,
             SUM(CASE WHEN ${out} THEN 1 ELSE 0 END) AS outbound_calls,
-            SUM(CASE WHEN ${out} AND ${M.ANSWERED_CALL_SQL()} THEN 1 ELSE 0 END) AS answered_outbound,
-            SUM(CASE WHEN ${out} AND ${M.CONVERSATION_CALL_SQL()} THEN 1 ELSE 0 END) AS conversation_calls
+            SUM(CASE WHEN ${M.ANSWERED_OUTBOUND_CALL_SQL()} THEN 1 ELSE 0 END) AS answered_outbound,
+            SUM(CASE WHEN ${M.CONVERSATION_CALL_SQL()} THEN 1 ELSE 0 END) AS conversation_calls
      FROM employee_calls
      WHERE tenant_id = $1 AND ${clause}`,
     params,
@@ -165,9 +169,9 @@ function buildKpis(summary, calls, cash, defs) {
  * filters as the Dashboard tiles, so "Total Leads", "Pipeline Value", Hot/Warm/Cold and Not Interested can
  * never disagree between the two pages.
  */
-async function getLeadSummary(tenantId, periodInput = {}, { employee, service } = {}) {
+async function getLeadSummary(tenantId, periodInput = {}, { employee, employeeId, service } = {}) {
   const period = M.resolvePeriod(periodInput);
-  const leads = await loadLeadUniverse(tenantId, period, { employee, service });
+  const leads = await loadLeadUniverse(tenantId, period, { employee, employeeId, service });
   const s = M.summarizeLeadUniverse(leads);
   const defs = M.buildDefinitions(period);
   return {
@@ -232,7 +236,7 @@ async function queryLeaderboard(tenantId, period, summary, limit = 3) {
     pool.query(
       `SELECT ec.employee_id, COUNT(*) AS total_calls,
               SUM(CASE WHEN ${out} THEN 1 ELSE 0 END) AS outbound_calls,
-              SUM(CASE WHEN ${out} AND ${M.ANSWERED_CALL_SQL("ec")} THEN 1 ELSE 0 END) AS pickup_calls
+              SUM(CASE WHEN ${M.ANSWERED_OUTBOUND_CALL_SQL("ec")} THEN 1 ELSE 0 END) AS pickup_calls
        FROM employee_calls ec WHERE ec.tenant_id = $1 AND ${callClause}
        GROUP BY ec.employee_id`,
       callParams,
@@ -422,7 +426,7 @@ async function queryTopCallers(tenantId, period, { employee } = {}) {
   }
   const { rows } = await pool.query(
     `SELECT e.name, COUNT(*) AS total_calls,
-            SUM(CASE WHEN ${M.OUTBOUND_CALL_SQL("ec")} AND ${M.ANSWERED_CALL_SQL("ec")} THEN 1 ELSE 0 END) AS pickup_calls
+            SUM(CASE WHEN ${M.ANSWERED_OUTBOUND_CALL_SQL("ec")} THEN 1 ELSE 0 END) AS pickup_calls
      FROM employee_calls ec
      INNER JOIN employees e ON e.id = ec.employee_id AND LOWER(COALESCE(e.status, 'active')) = 'active'
      WHERE ec.tenant_id = $1 AND ${clause} ${empFilter}

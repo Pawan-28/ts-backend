@@ -13,6 +13,10 @@ async function processRecentCalls() {
       try {
         console.log(`Processing call ID ${call.id} (callyzer_id: ${call.callyzer_call_id}, duration: ${call.duration_sec}s, outcome: ${call.outcome})...`);
         const updated = await processCallWithAi("default", call.id);
+        if (updated.skipped) {
+          console.log(`  -> SKIPPED: ID ${call.id} | ${updated.skipReason}`);
+          continue;
+        }
         console.log(`  -> SUCCESS: ID ${call.id} | Outcome: ${updated.outcome} | AI Summary length: ${updated.ai_summary?.length}`);
       } catch (err) {
         console.error(`  -> FAILED call ID ${call.id}:`, err.message);

@@ -1,7 +1,7 @@
 const pool = require("../../config/db");
 const mock = require("../data/mockFallback");
 const { PIPELINE_QUALIFIED_LEAD_SQL, CONTACTED_LEAD_SQL } = require("../utils/leadStats");
-const { CALL_CONVERSATION_MIN_SEC } = require("../utils/callMetrics");
+const { callSqlExprs, pickupRatePct } = require("../utils/callMetrics");
 const { buildPeriodDateFilter } = require("../utils/periodFilter");
 const {
   mapStageToId,
@@ -1270,8 +1270,10 @@ async function getIncentivesData(tenantId = TENANT, month) {
         ),
         pool.query(
           `SELECT employee_id, COUNT(*) AS total_calls,
-             SUM(CASE WHEN duration_sec > 0 THEN 1 ELSE 0 END) AS connected_calls,
-             SUM(CASE WHEN duration_sec >= ${CALL_CONVERSATION_MIN_SEC} THEN 1 ELSE 0 END) AS conversations_5min_plus
+             SUM(CASE WHEN ${callSqlExprs("").connected} THEN 1 ELSE 0 END) AS connected_calls,
+             SUM(CASE WHEN ${callSqlExprs("").outbound} THEN 1 ELSE 0 END) AS outbound_calls,
+             SUM(CASE WHEN ${callSqlExprs("").connectedOutbound} THEN 1 ELSE 0 END) AS answered_outbound_calls,
+             SUM(CASE WHEN ${callSqlExprs("").conversation} THEN 1 ELSE 0 END) AS conversations_5min_plus
            FROM employee_calls
            WHERE tenant_id = $1 AND DATE_FORMAT(COALESCE(started_at, created_at), '%Y-%m') = $2
            GROUP BY employee_id`,
@@ -1320,6 +1322,8 @@ async function getIncentivesData(tenantId = TENANT, month) {
         callsMap[r.employee_id] = {
           total: Number(r.total_calls) || 0,
           connected: Number(r.connected_calls) || 0,
+          outbound: Number(r.outbound_calls) || 0,
+          answeredOutbound: Number(r.answered_outbound_calls) || 0,
           conversations5Min: Number(r.conversations_5min_plus) || 0,
         };
       });
@@ -1355,10 +1359,11 @@ async function getIncentivesData(tenantId = TENANT, month) {
         const targetQualified = pickTarget(e.qualified_lead_target, savedRow.leads, 20);
         const targetMeetings = pickTarget(e.meeting_target, savedRow.meetings, 15);
         const targetCash = pickTarget(e.cash_target, savedRow.revenue, 100000);
-        const empCalls = callsMap[e.id] || { total: 0, connected: 0, conversations5Min: 0 };
+        const empCalls = callsMap[e.id] || { total: 0, connected: 0, outbound: 0, answeredOutbound: 0, conversations5Min: 0 };
         const empLeads = leadsMap[e.id] || { total: 0, qualified: 0, booked: 0, converted: 0 };
 
-        const pickupRate = empCalls.total > 0 ? Math.min(100, Math.round((empCalls.connected / empCalls.total) * 100)) : 0;
+        // ONE pickup definition: answered outbound / outbound dials (utils/callMetrics.js pickupRatePct).
+        const pickupRate = pickupRatePct(empCalls.answeredOutbound, empCalls.outbound);
         const qualificationRate = empLeads.total > 0 ? Math.min(100, Math.round((empLeads.qualified / empLeads.total) * 100)) : 0;
         const conversionRate = empLeads.total > 0 ? Math.min(100, Math.round((empLeads.converted / empLeads.total) * 100)) : 0;
         const objectionHandling = Math.min(99, Math.round(qualificationRate * 0.95) || 0);
@@ -1440,7 +1445,7 @@ async function getSalesFunnelKPIs(tenantId = TENANT, options = {}) {
   // If DB not available, return empty zeros — no mock data
   if (!(await dbReady())) {
     const emptyMetrics = [
-      { label: "Pickup Rate",        shortLabel: "Pickup",   value: 0, rgb: "124,58,237",  desc: "Calls answered vs dialed",       trend: "—" },
+      { label: "Pickup Rate",        shortLabel: "Pickup",   value: 0, rgb: "124,58,237",  desc: "Answered outbound vs outbound dials", trend: "—" },
       { label: "Qualification Rate", shortLabel: "Qualify",  value: 0, rgb: "220,38,120",  desc: "Qualified vs total leads",        trend: "—" },
       { label: "Conversion Rate",    shortLabel: "Convert",  value: 0, rgb: "16,185,129",  desc: "Closed deals vs total leads",     trend: "—" },
     ];
@@ -1548,7 +1553,9 @@ async function getSalesFunnelKPIs(tenantId = TENANT, options = {}) {
     pool.query(
       `SELECT
          COUNT(*)                                             AS total_calls,
-         SUM(CASE WHEN duration_sec > 0 THEN 1 ELSE 0 END)  AS connected_calls
+         SUM(CASE WHEN ${callSqlExprs("").connected} THEN 1 ELSE 0 END)  AS connected_calls,
+         SUM(CASE WHEN ${callSqlExprs("").outbound} THEN 1 ELSE 0 END)   AS outbound_calls,
+         SUM(CASE WHEN ${callSqlExprs("").connectedOutbound} THEN 1 ELSE 0 END) AS answered_outbound_calls
        FROM employee_calls WHERE ${callsWhere}`,
       callsParams
     ),
@@ -1584,11 +1591,13 @@ async function getSalesFunnelKPIs(tenantId = TENANT, options = {}) {
   const qualifiedLeads = Number(row.qualified_leads || 0);
   const convertedLeads = Number(row.converted_leads || 0);
   const totalCalls     = Number(callsResult.rows[0]?.total_calls     || 0);
-  const connectedCalls = Number(callsResult.rows[0]?.connected_calls || 0);
+  const outboundCalls  = Number(callsResult.rows[0]?.outbound_calls || 0);
+  const answeredOutboundCalls = Number(callsResult.rows[0]?.answered_outbound_calls || 0);
   const meetingsDone   = Number(meetingsResult.rows[0]?.meetings_done || 0);
 
   // Rates — kanban-scoped when available so Sales funnel matches Pipeline board
-  const pickupRate = totalCalls > 0 ? Math.min(100, Math.round((connectedCalls / totalCalls) * 100)) : 0;
+  // ONE pickup definition: answered outbound / outbound dials (utils/callMetrics.js pickupRatePct).
+  const pickupRate = pickupRatePct(answeredOutboundCalls, outboundCalls);
   const qualRate = totalCalls > 0 ? Math.min(100, Math.round((meetingsDone / totalCalls) * 100)) : 0;
   const convRate = kanbanScopedLeads > 0
     ? Math.min(100, Math.round((kanbanConversions / kanbanScopedLeads) * 100))
@@ -1611,7 +1620,7 @@ async function getSalesFunnelKPIs(tenantId = TENANT, options = {}) {
       stuckPipeline: oppTotals.stuck_pipeline,
     },
     metrics: [
-      { label: "Pickup Rate",        shortLabel: "Pickup",  value: pickupRate, rgb: "124,58,237", desc: "Calls answered vs dialed",   trend: `${pickupRate}% pickup` },
+      { label: "Pickup Rate",        shortLabel: "Pickup",  value: pickupRate, rgb: "124,58,237", desc: "Answered outbound calls vs outbound dials", trend: `${pickupRate}% pickup` },
       { label: "Qualification Rate", shortLabel: "Qualify", value: qualRate,   rgb: "220,38,120", desc: "Meetings done vs total calls", trend: `${qualRate}% qualified` },
       { label: "Conversion Rate",    shortLabel: "Convert", value: convRate,   rgb: "16,185,129", desc: "Closed deals vs total leads", trend: `${convRate}% converted` },
     ],

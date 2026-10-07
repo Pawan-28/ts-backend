@@ -235,10 +235,8 @@ async function createLead(input, options = {}) {
     if (rawPhone) patchField("phone", rawPhone);
     patchField("requirements", rawReqs);
     patchField("notes", rawNotes);
+    // Budget is only what the sender entered — never defaulted from the service catalog price.
     if (rawRev) patchField("expectedRevenue", Number(rawRev));
-    else if (matchedService && Number(matchedService.price_num) > 0 && !(Number(existingLead.expectedRevenue) > 0)) {
-      patchField("expectedRevenue", Number(matchedService.price_num));
-    }
     if (rawWinProb) patchField("winProbability", Number(rawWinProb));
     // NOTE: pipelineStage is intentionally NOT patched here. It is applied further
     // down via updateLeadStage(), the same canonical stage-transition mechanism used
@@ -388,12 +386,7 @@ async function createLead(input, options = {}) {
   };
 
   const normalized = normalizeLeadInput(enrichedInput);
-  // The sender gave no budget but the service has a catalog price → use the service price, so the
-  // pipeline card (e.g. ₹2.5L for a ₹2,50,000 service) matches the service it belongs to.
-  const servicePrice = Number(resolvedService?.price_num) || 0;
-  if (!(Number(normalized.expectedRevenue) > 0) && servicePrice > 0) {
-    normalized.expectedRevenue = servicePrice;
-  }
+  // Budget is only what the sender entered (else 0) — it is NOT defaulted from the service's catalog price.
   // Store the canonical SOP code (e.g. SOP-007) + name, even when the sender passed a numeric id or a title.
   if (resolvedSop) {
     normalized.sourceMeta = {

@@ -1,5 +1,6 @@
 const pool = require("../../config/db");
 const { logger } = require("../config/logger");
+const { aiSummarySkipReason } = require("../utils/callMetrics");
 
 // AI Call Summary & MoM now runs on Google Gemini (was OpenAI Whisper + gpt-4o-mini).
 // Key comes from the server environment only (GEMINI_API_KEY) — never sent to the
@@ -466,6 +467,16 @@ async function processCallWithAi(tenantId, callId) {
     throw err;
   }
   const call = callRes.rows[0];
+
+  // Never spend AI tokens (or write filler) on calls that never connected: duration 0, missed /
+  // rejected / not connected, or nothing to summarize (no recording and no transcript). The call
+  // row is left untouched; callers get a clear { skipped: true, skipReason } result.
+  const skipReason = aiSummarySkipReason(call);
+  if (skipReason) {
+    logger.info("Skipping AI summary for call", { callId, reason: skipReason });
+    return { ...call, skipped: true, skipReason, structuredSummary: null };
+  }
+
   const leadService = extractServiceFromRequirements(call.lead_requirements);
   const matchedSop = await findSopForService(tenantId, leadService);
   const sopGuidance = buildSopGuidanceBlock(matchedSop);
@@ -484,13 +495,7 @@ async function processCallWithAi(tenantId, callId) {
   });
 
   const rawOutcome = String(call.outcome || "").trim();
-  const isNotConnected =
-    /not connected|missed|rejected|unanswered|busy|failed/i.test(rawOutcome) ||
-    (durationSec <= 5 && !call.recording_url);
-
-  const effectiveOutcome = isNotConnected
-    ? (rawOutcome && !/connected/i.test(rawOutcome) ? rawOutcome : "Not Connected")
-    : (rawOutcome || "Connected");
+  const effectiveOutcome = rawOutcome || "Connected";
 
   let transcript = "";
   let transcriptSource = null; // "existing" | "gemini" | null
@@ -506,7 +511,6 @@ async function processCallWithAi(tenantId, callId) {
 
   const existingTranscript = String(call.transcript || "").trim();
   const hasUsableTranscript = Boolean(existingTranscript);
-  const hasRecording = Boolean(call.recording_url && String(call.recording_url).trim());
 
   if (hasUsableTranscript) {
     // Transcript/words are already on the call record (e.g. supplied by the call source
@@ -515,23 +519,8 @@ async function processCallWithAi(tenantId, callId) {
     logger.info("Using existing transcript already present on the call record — skipping transcription", { callId });
     transcript = existingTranscript;
     transcriptSource = "existing";
-  } else if (isNotConnected || !hasRecording) {
-    logger.info("Call is not connected or no recording present — set clear Not Connected summary", { callId });
-    summaryText = `[CALL STATUS: NOT CONNECTED]
-• Client: ${clientName}
-• Call Ref: #${call.id} | Date: ${dateStr} | Duration: ${durationStr} (Not Connected)
-• Status: ${effectiveOutcome}
-
-[CALL LOG SUMMARY]
-• Call attempt was not connected or not answered by the client.
-• No live audio conversation was recorded for this call log.
-
-[RECOMMENDED ACTION ITEMS]
-1. Re-attempt call or send a follow-up WhatsApp message.`;
-    transcript = "";
-    rating = 0;
   } else {
-    // No existing transcript, but a recording URL exists — transcribe with Gemini
+    // No existing transcript, but a recording URL exists (guaranteed by the skip guard above) — transcribe with Gemini
     // (audio → text), then summarize that transcript below exactly as before.
     if (!apiKey) {
       logger.warn("GEMINI_API_KEY not configured — cannot transcribe recording", { callId });
@@ -751,15 +740,22 @@ Return JSON with exact keys:
 
 async function ensureAllCallsProcessedWithAi(tenantId = "default") {
   try {
-    // Pass 1: calls with no ai_summary at all (null or empty)
+    // Pass 1: connected calls (duration > 0, with a recording or transcript) that have no
+    // ai_summary yet. Calls that never connected are never summarized (see shouldGenerateAiSummary).
     const unanalyzed = await pool.query(
-      `SELECT id FROM employee_calls
+      `SELECT id, outcome, direction, duration_sec, recording_url, transcript FROM employee_calls
        WHERE (tenant_id = $1 OR tenant_id IS NULL)
          AND (ai_summary IS NULL OR ai_summary = '' OR notes IS NULL OR notes = '')
+         AND duration_sec > 0
+         AND (
+           (recording_url IS NOT NULL AND recording_url <> '')
+           OR (transcript IS NOT NULL AND transcript <> '')
+         )
        ORDER BY id DESC LIMIT 100`,
       [tenantId]
     );
     for (const row of unanalyzed.rows) {
+      if (aiSummarySkipReason(row)) continue;
       try {
         await processCallWithAi(tenantId, row.id);
       } catch (e) {
@@ -775,6 +771,7 @@ async function ensureAllCallsProcessedWithAi(tenantId = "default") {
     const recordingButPlaceholder = await pool.query(
       `SELECT id FROM employee_calls
        WHERE (tenant_id = $1 OR tenant_id IS NULL)
+         AND duration_sec > 0
          AND (
            (
              recording_url IS NOT NULL AND recording_url <> ''
