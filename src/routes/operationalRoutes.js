@@ -28,6 +28,7 @@ const pool = require("../../config/db");
 const { queryCallStats } = require("../utils/employeeCallStats");
 const { callSqlExprs } = require("../utils/callMetrics");
 const { isValidDateKey } = require("../utils/periodFilter");
+const { loadCallHistory } = require("../utils/callHistory");
 const {
   buildClarityCallTitle,
   cleanServiceName,
@@ -954,6 +955,24 @@ router.get("/employee/:employeeId/lead-summary", requireEmployeeSelf(), asyncRou
     { employeeId: req.params.employeeId, service: req.query.service },
   );
   return res.json({ success: true, ...data });
+}));
+
+/**
+ * Full call history per person (phone) for the Pipeline column rules — all employees, all dates.
+ * Employee: only people with a lead assigned to that employee. Admin: everyone.
+ * See utils/callHistory.js.
+ */
+router.get("/employee/:employeeId/call-history", requireEmployeeSelf(), asyncRoute(async (req, res) => {
+  const history = await loadCallHistory(pool, tenant(req), { employeeId: req.params.employeeId });
+  return ok(res, history, { people: Object.keys(history).length });
+}));
+
+router.get("/pipeline/call-history", asyncRoute(async (req, res) => {
+  if (!isAdminUser(req)) {
+    return res.status(403).json({ success: false, message: "Admin access required" });
+  }
+  const history = await loadCallHistory(pool, tenant(req));
+  return ok(res, history, { people: Object.keys(history).length });
 }));
 
 router.get("/employee/:employeeId/pipeline/board", requireEmployeeSelf(), asyncRoute(async (req, res) => {
