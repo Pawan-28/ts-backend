@@ -2,6 +2,7 @@ const pool = require("../../config/db");
 const { buildPeriodDateFilter, buildPeriodOrCustomDateFilter } = require("../utils/periodFilter");
 const { toLocalSqlString } = require("../utils/appTimezone");
 const { extractTracking, withUtmSourceFallback } = require("../utils/leadMeta");
+const { annotateActiveMeetings } = require("../utils/activeMeetings");
 
 const DEFAULT_TENANT_ID = "default";
 const DEFAULT_CALL_LIST_LIMIT = Number(process.env.EMPLOYEE_CALLS_MAX || 10000);
@@ -270,6 +271,12 @@ function mapMeeting(row) {
     leadEmail: row.lead_email || null,
     leadCompany: row.lead_company || null,
     leadService: row.lead_service || null,
+    ...(row.lead_pipeline_stage !== undefined ? {
+      leadStage: row.lead_pipeline_stage,
+      leadStatus: row.lead_status,
+      leadAssignedTo: row.lead_assigned_to,
+      leadIsDeleted: row.lead_is_deleted,
+    } : {}),
     mom: row.mom || {},
     createdAt: toLocalSqlString(row.created_at),
   });
@@ -622,6 +629,18 @@ async function updateLead(tenantId, leadId, patch) {
 
   // Only after the DB update succeeded (updated row came back).
   if (touchesStatus && updatedLead && beforeStatus) {
+    // A lead that just LEFT Meeting Booked must no longer have an active meeting (Pipeline <-> Meetings page sync).
+    // Awaited so the API response already reflects it; a failure is logged, never thrown (the stage change stands).
+    try {
+      await require("../services/meetingSyncService").settleOnStageChange({
+        tenantId,
+        leadId: updatedLead.id,
+        before: { stage: beforeStatus.pipeline_stage, status: beforeStatus.status },
+        after: { stage: updatedLead.pipelineStage, status: updatedLead.status },
+      });
+    } catch (err) {
+      console.error(`[meetingSync] could not settle meetings for lead ${updatedLead.id}`, err);
+    }
     require("../services/leadStatusWebhookService").notifyLeadStatusUpdated({
       tenantId, leadId: updatedLead.id, before: beforeStatus,
     });
@@ -1536,6 +1555,7 @@ async function listMeetings(tenantId, employeeId, options = {}) {
   const result = await pool.query(
     `SELECT m.*,
             l.lead_name, l.phone AS lead_phone, l.email AS lead_email, l.company_name AS lead_company, l.form_name AS lead_service,
+            l.pipeline_stage AS lead_pipeline_stage, l.status AS lead_status, l.assigned_to AS lead_assigned_to, l.is_deleted AS lead_is_deleted,
             e.name AS employee_name
      FROM meetings m
      LEFT JOIN leads l ON l.id = m.lead_id
@@ -1544,7 +1564,9 @@ async function listMeetings(tenantId, employeeId, options = {}) {
      ORDER BY m.scheduled_at ASC LIMIT ${limit}`,
     [tenantId, employeeId],
   );
-  return result.rows.map(mapMeeting);
+  // Every meeting carries isActive / lifecycle (utils/activeMeetings): the API - not the UI - decides which meetings are
+  // the CURRENT Meeting Booked ones for this employee, so the Meetings page, Pipeline and dashboards read one truth.
+  return annotateActiveMeetings(result.rows.map(mapMeeting), { viewerEmployeeId: employeeId });
 }
 
 async function listTenantMeetings(tenantId, options = {}) {
@@ -1552,6 +1574,7 @@ async function listTenantMeetings(tenantId, options = {}) {
   const result = await pool.query(
     `SELECT m.*,
             l.lead_name, l.phone AS lead_phone, l.email AS lead_email, l.company_name AS lead_company, l.form_name AS lead_service,
+            l.pipeline_stage AS lead_pipeline_stage, l.status AS lead_status, l.assigned_to AS lead_assigned_to, l.is_deleted AS lead_is_deleted,
             e.name AS employee_name
      FROM meetings m
      LEFT JOIN leads l ON l.id = m.lead_id
@@ -1560,7 +1583,62 @@ async function listTenantMeetings(tenantId, options = {}) {
      ORDER BY m.scheduled_at ASC LIMIT ${limit}`,
     [tenantId],
   );
+  return annotateActiveMeetings(result.rows.map(mapMeeting));
+}
+
+/**
+ * Leads assigned to this employee that sit in Meeting Booked but have NO active meeting. They are Pipeline cards the Meetings
+ * page cannot show (nothing to schedule): the rep must book / reschedule a meeting for them.
+ */
+async function listMeetingBookedLeadsWithoutActiveMeeting(tenantId, employeeId, annotatedMeetings = []) {
+  const { isMeetingBookedStage, meetingPersonKey } = require("../utils/activeMeetings");
+  const result = await pool.query(
+    `SELECT id, lead_name, phone, pipeline_stage, status FROM leads
+     WHERE tenant_id = $1 AND assigned_to = $2 AND is_deleted = 0
+       AND (LOWER(COALESCE(pipeline_stage, '')) LIKE '%book%' OR LOWER(COALESCE(status, '')) LIKE '%book%')`,
+    [tenantId, employeeId],
+  );
+  const activeKeys = new Set(annotatedMeetings.filter((m) => m.isActive).map(meetingPersonKey));
+  return result.rows
+    .filter((l) => isMeetingBookedStage(l.pipeline_stage, l.status))
+    .filter((l) => !activeKeys.has(meetingPersonKey({ leadId: l.id, leadPhone: l.phone })))
+    .map((l) => ({ leadId: l.id, name: l.lead_name, stage: l.pipeline_stage }));
+}
+
+/** Scheduled (not completed / cancelled) meetings of ONE lead, oldest first. Used by the booking and stage-exit rules. */
+async function listScheduledMeetingsForLead(tenantId, leadId) {
+  const result = await pool.query(
+    `SELECT * FROM meetings WHERE tenant_id = $1 AND lead_id = $2 AND status = 'scheduled' ORDER BY scheduled_at ASC, id ASC`,
+    [tenantId, leadId],
+  );
   return result.rows.map(mapMeeting);
+}
+
+/** Scheduled meetings of every lead record that shares this phone (last 10 digits) - "one customer = one meeting". */
+async function listScheduledMeetingsForPhone(tenantId, phone10) {
+  const digits = String(phone10 || "").replace(/\D/g, "").slice(-10);
+  if (digits.length < 10) return [];
+  const result = await pool.query(
+    `SELECT m.*, l.phone AS lead_phone
+     FROM meetings m JOIN leads l ON l.id = m.lead_id
+     WHERE m.tenant_id = $1 AND m.status = 'scheduled' AND l.is_deleted = 0
+       AND RIGHT(REGEXP_REPLACE(l.phone, '[^0-9]', ''), 10) = $2
+     ORDER BY m.scheduled_at ASC, m.id ASC`,
+    [tenantId, digits],
+  );
+  return result.rows.map(mapMeeting);
+}
+
+/** Move scheduled meetings to completed / cancelled (history). NEVER deletes; only rows that are still 'scheduled'. */
+async function setScheduledMeetingsStatus(tenantId, meetingIds, status) {
+  if (!meetingIds.length) return 0;
+  if (!["completed", "cancelled"].includes(status)) throw new Error(`invalid settle status ${status}`);
+  const placeholders = meetingIds.map((_, i) => `$${i + 3}`).join(", ");
+  const result = await pool.query(
+    `UPDATE meetings SET status = $1 WHERE tenant_id = $2 AND status = 'scheduled' AND id IN (${placeholders})`,
+    [status, tenantId, ...meetingIds],
+  );
+  return result.rowCount ?? meetingIds.length;
 }
 
 async function listTenantCalls(tenantId, options = {}) {
@@ -2036,6 +2114,10 @@ module.exports = {
   findMeetingById,
   updateMeeting,
   listMeetings,
+  listScheduledMeetingsForLead,
+  listMeetingBookedLeadsWithoutActiveMeeting,
+  listScheduledMeetingsForPhone,
+  setScheduledMeetingsStatus,
   listTenantMeetings,
   listTenantCalls,
   insertFileAsset,

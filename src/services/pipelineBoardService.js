@@ -119,7 +119,7 @@ async function buildPipelineBoardPayload(tenantId, {
   const callPeriod = periodKey === "custom" && !exactCustom ? "month" : periodKey;
   const rangeOpts = exactCustom ? { startDate: customRange.startDate, endDate: customRange.endDate } : {};
 
-  const [stats, dbCalls, meetings, assignedNewLeads] = await Promise.all([
+  const [stats, dbCalls, allMeetings, assignedNewLeads] = await Promise.all([
     queryCallStats(pool, {
       tenantId,
       period: callPeriod,
@@ -130,10 +130,15 @@ async function buildPipelineBoardPayload(tenantId, {
       ? repo.listCalls(tenantId, employeeId, { period: callPeriod, limit: callLimit, ...rangeOpts })
       : repo.listTenantCalls(tenantId, { period: callPeriod, limit: callLimit, ...rangeOpts }),
     employeeId != null
-      ? repo.listMeetings(tenantId, employeeId, { limit: 1000 })
+      ? repo.listMeetings(tenantId, employeeId, { limit: 1000, includeAssignedLeads: true })
       : repo.listTenantMeetings(tenantId, { limit: 1000 }),
     useFullAttach ? Promise.resolve([]) : repo.listAssignedNewLeadsForPipeline(tenantId, employeeId),
   ]);
+
+  // Same ACTIVE-meeting definition as the Meetings page (utils/activeMeetings): a still-"scheduled" meeting whose lead is no
+  // longer in Meeting Booked, that was replaced by a newer one, or that belongs to another employee's lead is NOT sent to the
+  // board, so it can neither create nor keep a Meeting Booked card. Completed meetings stay (they place Meeting Done).
+  const meetings = allMeetings.filter((m) => m.status !== "scheduled" || m.isActive !== false);
 
   let leads;
   if (useFullAttach) {

@@ -257,6 +257,22 @@ const updateLead = async (req, res) => {
       [id],
     );
 
+    // Meeting Booked <-> Meetings page sync: INTO Meeting Booked needs a scheduled meeting; OUT of it settles the meeting.
+    const meetingSync = require("../services/meetingSyncService");
+    const meetingTenant = prevStatus.rows[0]?.tenant_id || "default";
+    const beforeStage = prevStatus.rows[0]
+      ? { stage: prevStatus.rows[0].pipeline_stage, status: prevStatus.rows[0].status }
+      : { stage: "", status: "" };
+    try {
+      await meetingSync.guardEnterMeetingBooked({
+        tenantId: meetingTenant, leadId: Number(id), before: beforeStage,
+        after: { stage: pipeline_stage || "New Lead", status: status || "New Lead" },
+      });
+    } catch (guardErr) {
+      if (guardErr.status === 409) return res.status(409).json({ success: false, message: guardErr.message });
+      throw guardErr;
+    }
+
     const result = await pool.query(
       `UPDATE leads SET
         lead_name=$1, phone=$2, email=$3, city=$4, company_name=$5,
@@ -282,6 +298,15 @@ const updateLead = async (req, res) => {
       return res.status(404).json({ success: false, message: "Lead not found" });
 
     const lead = result.rows[0];
+
+    try {
+      await meetingSync.settleOnStageChange({
+        tenantId: meetingTenant, leadId: Number(id), before: beforeStage,
+        after: { stage: lead.pipeline_stage, status: lead.status },
+      });
+    } catch (settleErr) {
+      console.error(`[meetingSync] could not settle meetings for lead ${id}`, settleErr);
+    }
 
     // Converted / Advanced Paid → n8n (after the successful update; never blocks/rolls back).
     if (prevStatus.rows[0]) {

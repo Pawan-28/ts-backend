@@ -67,6 +67,7 @@ const {
 } = require("../services/operationalServices");
 const callyzer = require("../services/callyzerService");
 const n8nWebhookService = require("../services/n8nWebhookService");
+const meetingSync = require("../services/meetingSyncService");
 const { logger } = require("../config/logger");
 const {
   buildPipelineBoardPayload,
@@ -362,6 +363,23 @@ router.get("/leads/:id", requireEmployeeOwnsLead(), asyncRoute(async (req, res) 
 
 router.put("/leads/:id", requireEmployeeOwnsLead(), asyncRoute(async (req, res) => {
   const patch = { ...req.body, lastActivityAt: new Date() };
+  // A stage / status edit INTO Meeting Booked needs a scheduled meeting first (leaving it is settled inside repo.updateLead).
+  if (req.body?.pipelineStage !== undefined || req.body?.status !== undefined) {
+    const current = await repo.findLeadById(tenant(req), req.params.id).catch(() => null);
+    if (current) {
+      try {
+        await meetingSync.guardEnterMeetingBooked({
+          tenantId: tenant(req),
+          leadId: current.id,
+          before: { stage: current.pipelineStage, status: current.status },
+          after: { stage: req.body.pipelineStage ?? current.pipelineStage, status: req.body.status ?? current.status },
+        });
+      } catch (err) {
+        if (err.status === 409) return res.status(409).json({ success: false, code: err.code, message: err.message });
+        throw err;
+      }
+    }
+  }
   // Keep temperature canonical (hot/warm/cold) so "Cold Lead" and "cold" never disagree.
   if (typeof patch.temperature === "string") {
     const t = patch.temperature.toLowerCase();
@@ -1293,7 +1311,13 @@ router.post("/employee/meetings", validate(meetingSchema), requireEmployeeSelfBo
       repo.findLeadById(tenantId, req.body.leadId),
       repo.findEmployeeById(tenantId, req.body.employeeId),
     ]);
-    await n8nWebhookService.sendMeetingBookedWebhook({ meeting, lead, employee, serviceName });
+    // A repeat booking for a customer who already has an active meeting RESCHEDULED it (same row): send the
+    // "rescheduled" webhook, not a second "booked" one.
+    if (meeting.rescheduled) {
+      await n8nWebhookService.sendMeetingRescheduledWebhook({ meeting, lead, employee, serviceName });
+    } else {
+      await n8nWebhookService.sendMeetingBookedWebhook({ meeting, lead, employee, serviceName });
+    }
   } catch (err) {
     logger.error("n8n meeting-booked webhook failed (meeting save unaffected)", {
       meetingId: meeting.id,
@@ -1309,6 +1333,21 @@ router.patch("/employee/meetings/:id", validate(meetingPatchSchema), asyncRoute(
   const existing = await repo.findMeetingById(tenantId, req.params.id);
   if (!existing) return res.status(404).json({ success: false, message: "Meeting not found" });
   if (!denyUnlessSelfOrAdmin(req, res, existing.employeeId)) return;
+
+  // One customer = one active meeting, and only an ACTIVE (scheduled) meeting can be moved to a new time.
+  const reactivating = req.body.status === "scheduled" && existing.status !== "scheduled";
+  const movingHistory = req.body.scheduledAt !== undefined && existing.status !== "scheduled" && !reactivating;
+  if (movingHistory) {
+    return res.status(409).json({ success: false, message: `This meeting is ${existing.status} - book a new meeting or reschedule the active one.` });
+  }
+  if (reactivating) {
+    const lead = await repo.findLeadById(tenantId, existing.leadId).catch(() => null);
+    const others = lead ? (await meetingSync.findExistingScheduledForCustomer(tenantId, lead)).filter((m) => String(m.id) !== String(existing.id)) : [];
+    if (others.length) {
+      return res.status(409).json({ success: false, message: "This customer already has an active meeting - reschedule that one instead of re-opening this one." });
+    }
+  }
+
   const meeting = await repo.updateMeeting(tenantId, req.params.id, req.body);
   if (!meeting) return res.status(404).json({ success: false, message: "Meeting not found" });
 
@@ -1350,7 +1389,16 @@ router.patch("/employee/meetings/:id/mom", validate(momSchema), asyncRoute(async
 
 router.get("/employee/:employeeId/meetings", requireEmployeeSelf(), asyncRoute(async (req, res) => {
   const meetings = await repo.listMeetings(tenant(req), req.params.employeeId, { includeAssignedLeads: true });
-  return ok(res, meetings);
+  // `isActive` / `lifecycle` on every row come from the backend (utils/activeMeetings). `meta` lets the page prove it matches
+  // the Pipeline: active meetings vs Meeting Booked cards, and the cards that have no meeting yet.
+  const bookedWithoutMeeting = await repo.listMeetingBookedLeadsWithoutActiveMeeting(tenant(req), req.params.employeeId, meetings);
+  return ok(res, meetings, {
+    meta: {
+      activeCount: meetings.filter((m) => m.isActive).length,
+      historyCount: meetings.filter((m) => !m.isActive).length,
+      bookedWithoutMeeting,
+    },
+  });
 }));
 
 router.get("/analytics/admin/kpis", asyncRoute(async (req, res) => {

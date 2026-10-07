@@ -581,11 +581,21 @@ async function updatePipelineLeadStage(leadId, stage, tenantId = TENANT) {
     "SELECT pipeline_stage, status FROM leads WHERE id = $1 AND tenant_id = $2 LIMIT 1",
     [leadId, tenantId],
   );
+  // Meeting Booked <-> Meetings page sync (same rule as repo.updateLead / updateLeadStage): a person moving a lead INTO
+  // Meeting Booked needs a scheduled meeting first; a lead LEAVING it has its scheduled meeting settled to history.
+  const meetingSync = require("./meetingSyncService");
+  const beforeStage = prev.rows[0] ? { stage: prev.rows[0].pipeline_stage, status: prev.rows[0].status } : { stage: "", status: "" };
+  await meetingSync.guardEnterMeetingBooked({ tenantId, leadId, before: beforeStage, after: { stage: dbStage, status: dbStage } });
   await pool.query(
     `UPDATE leads SET pipeline_stage = $1, status = $1, updated_at = NOW(), last_activity_at = NOW()
      WHERE id = $2 AND tenant_id = $3`,
     [dbStage, leadId, tenantId],
   );
+  try {
+    await meetingSync.settleOnStageChange({ tenantId, leadId, before: beforeStage, after: { stage: dbStage, status: dbStage } });
+  } catch (err) {
+    console.error(`[meetingSync] could not settle meetings for lead ${leadId}`, err);
+  }
   // Converted / Advanced Paid → n8n (after the successful update; never blocks/rolls back).
   if (prev.rows[0]) {
     require("./leadStatusWebhookService").notifyLeadStatusUpdated({ tenantId, leadId, before: prev.rows[0] });

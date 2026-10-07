@@ -6,3 +6,4 @@ uploads/*
 *.log
 ngrok.exe
 *.exe
+.env.preflight

@@ -6,6 +6,8 @@ const { cacheGet, cacheSet } = require("../config/redis");
 const pool = require("../../config/db");
 const googleMeet = require("./googleMeetService");
 const { extractWebhookMeeting } = require("../utils/webhookMeeting");
+const meetingSync = require("./meetingSyncService");
+const { mapStageToId } = require("../utils/pipelineStages");
 
 const { DEFAULT_TENANT_ID } = repo;
 
@@ -301,6 +303,7 @@ async function createLead(input, options = {}) {
           leadId: existingLead.id,
           stage: rawStage,
           actor: options.actor,
+          skipMeetingGuard: true,
         });
       } catch (stageErr) {
         console.error("[createLead] Failed to apply pipeline stage from webhook:", stageErr);
@@ -755,11 +758,22 @@ async function bulkAssign({ tenantId, leadIds, employeeId, method = "bulk", acto
   return results;
 }
 
-async function updateLeadStage({ tenantId, leadId, stage, status, actor: a }) {
+async function updateLeadStage({ tenantId, leadId, stage, status, actor: a, skipMeetingGuard = false }) {
   const lead = await repo.findLeadById(tenantId, leadId);
   if (!lead) throw new Error("Lead not found");
   const before = { ...lead };
   const from = lead.pipelineStage;
+
+  // Moving a lead INTO Meeting Booked needs a scheduled meeting (book / reschedule one first). Webhook intake passes
+  // skipMeetingGuard: the customer's own booking creates the meeting right after the stage is applied.
+  if (!skipMeetingGuard) {
+    await meetingSync.guardEnterMeetingBooked({
+      tenantId,
+      leadId,
+      before: { stage: lead.pipelineStage, status: lead.status },
+      after: { stage, status: status ?? lead.status },
+    });
+  }
 
   const patch = {
     pipelineStage: stage,
@@ -904,7 +918,7 @@ ${agenda}`;
     const existing = await repo.findActiveMeetingAt(tenantId, lead.id, scheduledAt);
     if (existing) return existing;
 
-    return await createMeeting({
+    const saved = await createMeeting({
       tenantId,
       data: {
         leadId: lead.id,
@@ -919,9 +933,27 @@ ${agenda}`;
       },
       actor: a,
     });
+    await ensureLeadIsMeetingBooked({ tenantId, leadId: lead.id, actor: a });
+    return saved;
   } catch (err) {
     console.error(`[webhookMeeting] Lead #${lead?.id}: failed to save meeting`, err);
     return null;
+  }
+}
+
+/**
+ * A customer's own booking means the lead IS in Meeting Booked - otherwise the meeting would not be an ACTIVE one
+ * (utils/activeMeetings) and would not show on the Meetings page. Won / paid leads are left where they are.
+ */
+async function ensureLeadIsMeetingBooked({ tenantId, leadId, actor: a }) {
+  try {
+    const current = await repo.findLeadById(tenantId, leadId);
+    if (!current) return;
+    const id = mapStageToId(current.pipelineStage, current.status);
+    if (["meeting_booked", "advance_paid", "payment_complete"].includes(id)) return;
+    await updateLeadStage({ tenantId, leadId, stage: "Meeting Booked", actor: a, skipMeetingGuard: true });
+  } catch (err) {
+    console.error(`[webhookMeeting] Lead #${leadId}: could not set stage Meeting Booked`, err);
   }
 }
 
@@ -930,6 +962,14 @@ async function createMeeting({ tenantId, data, actor: a }) {
   const location = String(payload.location || "").toLowerCase();
   const isGoogleMeet = location.includes("google meet");
   const meetLink = String(payload.meetLink || "").trim();
+
+  // ONE CUSTOMER = ONE ACTIVE MEETING. If this lead (or another record with the same phone) already has a scheduled
+  // meeting, a new booking RESCHEDULES that meeting (same row, new date/time) instead of inserting a second one.
+  const bookingLead = await repo.findLeadById(tenantId, payload.leadId).catch(() => null);
+  const plan = bookingLead ? await meetingSync.planCustomerBooking(tenantId, bookingLead) : { action: "insert" };
+  if (plan.action === "reschedule") {
+    return rescheduleExistingMeeting({ tenantId, existing: plan.existing, payload, a });
+  }
 
   if (isGoogleMeet && !meetLink) {
     if (!googleMeet.isConfigured()) {
@@ -968,6 +1008,43 @@ async function createMeeting({ tenantId, data, actor: a }) {
     // Meeting is already saved — notification failure must not fail the request.
   }
   return meeting;
+}
+
+/** A repeat booking for a customer who already has an active meeting: update THAT meeting, never insert another. */
+async function rescheduleExistingMeeting({ tenantId, existing, payload, a }) {
+  const patch = {
+    scheduledAt: payload.scheduledAt,
+    durationMin: payload.durationMin || existing.durationMin || undefined,
+    title: payload.title || existing.title || undefined,
+    location: payload.location || existing.location || undefined,
+    // A Meet link does not depend on the time, so keep the existing one unless the booking brought a new link.
+    meetLink: String(payload.meetLink || "").trim() || existing.meetLink || undefined,
+    agenda: payload.agenda || undefined,
+  };
+  for (const k of Object.keys(patch)) if (patch[k] === undefined) delete patch[k];
+  const meeting = await repo.updateMeeting(tenantId, existing.id, patch);
+  await writeTimeline({
+    tenantId,
+    leadId: existing.leadId,
+    type: "meeting",
+    summary: "Meeting rescheduled",
+    payload: { meetingId: existing.id, from: existing.scheduledAt, to: meeting.scheduledAt },
+    actor: a,
+  });
+  try {
+    await notify({
+      tenantId,
+      employeeId: existing.employeeId,
+      type: "meeting_rescheduled",
+      title: "Meeting rescheduled",
+      body: meeting.title,
+      entityType: "meeting",
+      entityId: meeting.id,
+    });
+  } catch {
+    // Meeting is already saved - a notification failure must not fail the request.
+  }
+  return { ...meeting, rescheduled: true, previousScheduledAt: existing.scheduledAt };
 }
 
 async function addMom({ tenantId, meetingId, mom, actor: a }) {

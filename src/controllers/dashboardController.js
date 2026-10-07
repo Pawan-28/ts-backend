@@ -131,7 +131,7 @@ const patchPipelineLead = async (req, res) => {
     await dataService.updatePipelineLeadStage(req.params.id, stage);
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    res.status(err.status || 500).json({ success: false, message: err.message });
   }
 };
 
