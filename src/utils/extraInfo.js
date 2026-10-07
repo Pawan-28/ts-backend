@@ -19,6 +19,8 @@ const UNKNOWN = "Unknown";
 
 /** Stored AI fields, in display order. `kind` drives validation. */
 const EXTRA_INFO_FIELDS = [
+  { key: "business", label: "Business / Job", kind: "text" },
+  { key: "interests", label: "Interests / Hobbies", kind: "text" },
   { key: "requirement", label: "Requirement", kind: "text" },
   { key: "intent", label: "Intent", kind: "enum", values: ["Interested", "Interested but delayed", "Considering", "Not Interested"] },
   { key: "budget", label: "Budget", kind: "text" },
@@ -126,6 +128,8 @@ function storedValues(stored) {
 /** Prompt block that is added to the EXISTING MoM prompt (one Gemini call). */
 function extraInfoPromptBlock() {
   return `7. "extraInfo": a SHORT customer sales profile from THIS call only. Every value must be stated in the transcript; NEVER guess. If a field was not discussed, return "Not discussed" (for "intent" return "Unknown" when unclear). Keep each value under 12 words, in English. Keys:
+   - "business": the customer's own business, profession or job, only if they said it, else "Not discussed"
+   - "interests": the customer's personal interests / hobbies, only if they said them, else "Not discussed"
    - "requirement": what the customer is looking for / discussing
    - "intent": exactly one of "Interested", "Interested but delayed", "Considering", "Not Interested", "Unknown"
    - "budget": the customer's actual budget only if said (with the exact figure), else "Not discussed"
@@ -143,6 +147,8 @@ function extraInfoPromptBlock() {
 
 // Placeholders only - real example values would be copied by the model.
 const EXTRA_INFO_JSON_EXAMPLE = `  "extraInfo": {
+    "business": "<their business / profession / job if said, else Not discussed>",
+    "interests": "<their interests / hobbies if said, else Not discussed>",
     "requirement": "<from the transcript, or Not discussed>",
     "intent": "<Interested | Interested but delayed | Considering | Not Interested | Unknown>",
     "budget": "<exact figure if said, else Not discussed>",

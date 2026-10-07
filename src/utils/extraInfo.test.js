@@ -12,9 +12,9 @@ const T1 = "2026-10-01T10:00:00.000Z";
 const T2 = "2026-10-05T10:00:00.000Z";
 const T3 = "2026-10-09T10:00:00.000Z";
 
-test("the profile has exactly the 12 AI fields (temperature is read from the lead, not stored)", () => {
+test("the profile has exactly the 14 AI fields (temperature is read from the lead, not stored)", () => {
   assert.deepEqual(EXTRA_INFO_FIELDS.map((f) => f.key), [
-    "requirement", "intent", "budget", "offerQuoted", "mainConcern", "purchaseTimeline", "decisionMaker", "objection", "nextAction", "followUp", "meeting", "conversion",
+    "business", "interests", "requirement", "intent", "budget", "offerQuoted", "mainConcern", "purchaseTimeline", "decisionMaker", "objection", "nextAction", "followUp", "meeting", "conversion",
   ]);
   assert.ok(!EXTRA_INFO_FIELDS.some((f) => /temperature/i.test(f.key)), "Lead Temperature keeps its existing source of truth");
 });
@@ -35,6 +35,9 @@ test("normalisation: enums are exact, free text is trimmed and short, junk is dr
     followUp: { needed: "yes", when: "after certification update" }, meeting: "Not discussed", conversion: "not converted",
   });
   assert.equal(out.requirement, "Podcast");
+  assert.equal(normalizeExtraInfo({ business: "  Runs a dental clinic ", interests: "Cricket, travel" }).business, "Runs a dental clinic");
+  assert.equal(normalizeExtraInfo({ interests: "Cricket, travel" }).interests, "Cricket, travel");
+  assert.deepEqual(normalizeExtraInfo({ business: "Not discussed", interests: "Not mentioned" }), {}, "profile fields are never guessed");
   assert.equal(out.intent, "Interested but delayed");
   assert.deepEqual(out.followUp, { needed: "Yes", when: "after certification update" });
   assert.equal(out.conversion, "Not converted");
