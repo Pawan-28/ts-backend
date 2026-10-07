@@ -1,4 +1,5 @@
 const dataService = require("../services/dataService");
+const dashboardMetrics = require("../services/dashboardMetricsService");
 const mock = require("../data/mockFallback");
 
 const getDashboard = async (req, res) => {
@@ -97,6 +98,23 @@ const getFilterRange = async (req, res) => {
       endDate: req.query.endDate,
     });
     res.json(data);
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+const getLeadSummary = async (req, res) => {
+  try {
+    const data = await dashboardMetrics.getLeadSummary(
+      "default", // same default tenant the other dashboard endpoints use (dataService TENANT)
+      {
+        period: req.query.period || req.query.range || "month",
+        startDate: req.query.startDate,
+        endDate: req.query.endDate,
+      },
+      { employee: req.query.employee, service: req.query.service },
+    );
+    res.json({ success: true, ...data });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -306,6 +324,7 @@ module.exports = {
   getPipeline,
   getPipelineStatus,
   getFilterRange,
+  getLeadSummary,
   getPipelineLeads,
   patchPipelineLead,
   getLeadTasks,

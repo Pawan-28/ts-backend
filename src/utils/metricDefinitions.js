@@ -138,6 +138,7 @@ function summarizeLeadUniverse(rows = []) {
   let revenue = 0;
   let closed = 0;
   let openLeads = 0;
+  let notInterested = 0;
 
   for (const row of rows) {
     const { stageId, idx } = funnelIndexForLead(row);
@@ -155,6 +156,7 @@ function summarizeLeadUniverse(rows = []) {
       openLeads += 1;
       pipelineValue += value;
     }
+    if (stageId === "not_interested") notInterested += 1;
     for (let i = 0; i <= idx; i += 1) {
       funnel[FUNNEL_STAGES[i]] += 1;
       grid[temp][FUNNEL_STAGES[i]] += 1;
@@ -185,6 +187,7 @@ function summarizeLeadUniverse(rows = []) {
     negotiation: funnel.Negotiation,
     closed,
     openLeads,
+    notInterested,
     notInFunnel: total - funnel.Contacted,
     pipelineValue,
     revenue,

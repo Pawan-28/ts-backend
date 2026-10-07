@@ -10,6 +10,7 @@ const {
   getPipeline,
   getPipelineStatus,
   getFilterRange,
+  getLeadSummary,
   getPipelineLeads,
   patchPipelineLead,
   getLeadTasks,
@@ -38,6 +39,7 @@ router.get("/revenue", getRevenue);
 router.get("/pipeline", getPipeline);
 router.get("/pipeline-status", getPipelineStatus);
 router.get("/filter-range", getFilterRange);
+router.get("/lead-summary", getLeadSummary);
 
 // KANBAN LEADS
 router.get("/pipeline/leads", getPipelineLeads);

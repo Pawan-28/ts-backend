@@ -41,7 +41,7 @@ async function loadLeadUniverse(tenantId, period, { service, employee, dateMode 
   if (service && service !== "All Services") {
     params.push(`%${service}%`);
     const idx = params.length;
-    where.push(`(l.form_name LIKE $${idx} OR l.keyword LIKE $${idx} OR l.source LIKE $${idx})`);
+    where.push(`(l.form_name LIKE $${idx} OR l.keyword LIKE $${idx} OR l.source LIKE $${idx} OR l.requirements LIKE $${idx})`);
   }
   if (employee && employee !== "All Employees") {
     params.push(employee);
@@ -158,6 +158,33 @@ function buildKpis(summary, calls, cash, defs) {
     tile("pipelineValue", "Pipeline Value", summary.pipelineValue, "DollarSign", true),
     tile("closings", "Closed Deals", summary.closed, "Trophy"),
   ];
+}
+
+/**
+ * Lead-count tiles for other pages (Pipeline summary row). Same lead universe, period and employee/service
+ * filters as the Dashboard tiles, so "Total Leads", "Pipeline Value", Hot/Warm/Cold and Not Interested can
+ * never disagree between the two pages.
+ */
+async function getLeadSummary(tenantId, periodInput = {}, { employee, service } = {}) {
+  const period = M.resolvePeriod(periodInput);
+  const leads = await loadLeadUniverse(tenantId, period, { employee, service });
+  const s = M.summarizeLeadUniverse(leads);
+  const defs = M.buildDefinitions(period);
+  return {
+    period,
+    total: s.total,
+    openLeads: s.openLeads,
+    closed: s.closed,
+    notInterested: s.notInterested,
+    pipelineValue: s.pipelineValue,
+    hot: s.tempTotals.Hot,
+    warm: s.tempTotals.Warm,
+    cold: s.tempTotals.Cold,
+    definitions: {
+      totalLeads: `${defs.totalLeads.formula}. ${defs.totalLeads.basis}.`,
+      pipelineValue: `${defs.pipelineValue.formula}. ${defs.pipelineValue.basis}.`,
+    },
+  };
 }
 
 /* ───────────────────────────── Funnel grid ───────────────────────────── */
@@ -530,6 +557,7 @@ async function getSalesInsights(tenantId, options = {}) {
 
 module.exports = {
   loadLeadUniverse,
+  getLeadSummary,
   queryDashboardStats,
   queryCallStats,
   queryCashTotal,
