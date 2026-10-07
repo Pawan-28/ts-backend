@@ -82,6 +82,7 @@ const getSettings = async (req, res) => {
     ratingThresholds: s.ratingThresholds,
     currentVersion: s.currentVersion,
     dismissedSources: s.dismissedSources || {},
+    customSources: Array.isArray(s.customSources) ? s.customSources : [],
     integrations: [
       { id: 1, name: "Google Sign-In", connected: false, type: "auth" },
       { id: 2, name: "Google Calendar", connected: true, type: "calendar" },

@@ -69,6 +69,8 @@ const callyzer = require("../services/callyzerService");
 const n8nWebhookService = require("../services/n8nWebhookService");
 const meetingSync = require("../services/meetingSyncService");
 const { supersedingMeeting } = require("../utils/activeMeetings");
+const leadSourcesUtil = require("../utils/leadSources");
+const dataServiceForSettings = require("../services/dataService");
 const { logger } = require("../config/logger");
 const {
   buildPipelineBoardPayload,
@@ -354,6 +356,43 @@ router.get("/leads", asyncRoute(async (req, res) => {
     { page, limit },
   );
   return ok(res, items, { page, limit, total });
+}));
+
+/* ───── Lead sources: ONE list for the admin Sources page and every source dropdown ───── */
+const sourceListCache = new Map(); // tenant -> { at, leads }
+async function loadSourceLeads(tenantId) {
+  const hit = sourceListCache.get(tenantId);
+  if (hit && Date.now() - hit.at < 20_000) return hit.leads;
+  const result = await pool.query(
+    `SELECT id, source, form_name, keyword, source_meta, lead_name, email, phone, assigned_by, created_at
+       FROM leads WHERE tenant_id = $1 AND is_deleted = 0`,
+    [tenantId],
+  );
+  sourceListCache.set(tenantId, { at: Date.now(), leads: result.rows });
+  return result.rows;
+}
+
+// The sources the admin Sources page shows (plus custom ones). Every dropdown offers exactly these.
+router.get("/lead-sources", asyncRoute(async (req, res) => {
+  const tenantId = tenant(req);
+  const [leads, settingsRes] = await Promise.all([loadSourceLeads(tenantId), dataServiceForSettings.getSettings(dataServiceForSettings.TENANT)]);
+  const s = settingsRes.settings || {};
+  return ok(res, leadSourcesUtil.listLeadSources(leads, { dismissed: s.dismissedSources, customSources: s.customSources }));
+}));
+
+// "+ Add new..." in a source dropdown: the new source is saved and shows on the admin Sources page immediately.
+router.post("/lead-sources", asyncRoute(async (req, res) => {
+  const tenantId = tenant(req);
+  const [leads, settingsRes] = await Promise.all([loadSourceLeads(tenantId), dataServiceForSettings.getSettings(dataServiceForSettings.TENANT)]);
+  const plan = leadSourcesUtil.planAddSource(req.body?.label, { leads, settings: settingsRes.settings || {} });
+  if (plan.status === "invalid") return res.status(400).json({ success: false, message: plan.reason });
+  if (plan.status === "created") {
+    await dataServiceForSettings.saveSettings(dataServiceForSettings.TENANT, plan.nextSettings);
+    sourceListCache.delete(tenantId);
+  }
+  const s = plan.status === "created" ? plan.nextSettings : (settingsRes.settings || {});
+  const list = leadSourcesUtil.listLeadSources(leads, { dismissed: s.dismissedSources, customSources: s.customSources });
+  return ok(res, list, { source: plan.source, created: plan.status === "created", alreadyExists: plan.status === "exists" });
 }));
 
 router.get("/leads/:id", requireEmployeeOwnsLead(), asyncRoute(async (req, res) => {
