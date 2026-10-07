@@ -379,7 +379,7 @@ const NEXT_ACTION = {
   lead: { cta: "Contact Lead", text: "has not been contacted yet - place the first call", early: true },
   not_pick: { cta: "Retry Call", text: "has not answered previous calls - retry at a different time", early: true },
   short_call: { cta: "Follow Up", text: "only had a short call - follow up to qualify and book a meeting", early: true },
-  conversation_2min: { cta: "Book Meeting", text: "has had a 2 min+ conversation - book a meeting", early: false },
+  conversation_2min: { cta: "Book Meeting", text: "has had a conversation above 2 min - book a meeting", early: false },
   meeting_booked: { cta: "Confirm Meeting", text: "has a meeting booked - confirm the slot and prepare", early: false },
   meeting_done: { cta: "Send Proposal", text: "has completed a meeting - send the proposal", early: false },
   proposal_sent: { cta: "Follow Up", text: "has a proposal out - follow up for a decision", early: false },

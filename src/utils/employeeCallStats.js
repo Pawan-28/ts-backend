@@ -13,8 +13,8 @@ function formatDurationHms(seconds) {
  * Row (from callStatsAggSql) -> API stats. The call counts are a PARTITION of totalCalls
  * (definitions live in utils/callMetrics.js - the one shared definition):
  *   totalCalls     = connectedCalls + notConnectedCalls
- *   connectedCalls = conversations5MinPlus (answered, talk >= 2 min) + shortCalls (answered OUTBOUND < 2 min)
- *                    + incomingShortCalls (answered INCOMING < 2 min)
+ *   connectedCalls = conversations5MinPlus (answered, talk above 2 min) + shortCalls (answered OUTBOUND, 1-120 s)
+ *                    + incomingShortCalls (answered INCOMING, 1-120 s)
  *   notConnectedCalls = notPickupByClient (OUTBOUND, not answered - "Not pick") + rejectedCalls
  *                       + missedCalls (INCOMING, not answered)
  * Rejected is never counted inside Not pick. `neverAttended` is a SUBSET of missedCalls (missed incoming never

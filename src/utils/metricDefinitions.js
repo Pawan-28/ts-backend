@@ -87,8 +87,8 @@ const FUNNEL_STAGES = ["Contacted", "Qualified", "Meeting", "Negotiation", "Conv
 const STAGE_TO_FUNNEL = [
   { stageId: "lead", funnelStage: null, note: "New lead, not contacted yet" },
   { stageId: "not_pick", funnelStage: null, note: "Dialled but never answered" },
-  { stageId: "short_call", funnelStage: "Contacted", note: "Answered, conversation under 2 min" },
-  { stageId: "conversation_2min", funnelStage: "Qualified", note: "2 min+ conversation" },
+  { stageId: "short_call", funnelStage: "Contacted", note: "Answered, conversation up to and including 2 min" },
+  { stageId: "conversation_2min", funnelStage: "Qualified", note: "Answered conversation above 2 min" },
   { stageId: "meeting_booked", funnelStage: "Meeting", note: "Meeting booked" },
   { stageId: "meeting_done", funnelStage: "Meeting", note: "Meeting held" },
   { stageId: "proposal_sent", funnelStage: "Negotiation", note: "Proposal sent" },
@@ -200,7 +200,7 @@ function summarizeLeadUniverse(rows = []) {
 /**
  * Pickup = answered OUTBOUND calls (Conversation + Short) / OUTBOUND dials (period) - the one shared
  *          definition (utils/callMetrics.js pickupRatePct); no other pickup calculation exists.
- * Qualification = leads that reached a 2 min+ conversation or a booked meeting / total leads (period).
+ * Qualification = leads that reached a conversation above 2 min or a booked meeting / total leads (period).
  * Conversion = payment-complete leads / total leads (period).
  */
 function computeRates({ summary, calls }) {
@@ -229,7 +229,7 @@ function compareLeaderboard(a, b) {
 //   OUTBOUND = outbound dials (outbound direction + unanswered dials legacy-tagged inbound)
 //   ANSWERED = connected (Conversation + Short + Incoming short), any direction
 //   ANSWERED_OUTBOUND = Conversation/Short with outbound direction (the pickup-rate numerator)
-//   CONVERSATION = answered, talk >= 2 min, any direction
+//   CONVERSATION = answered, talk above 2 min (> 120 s), any direction
 const OUTBOUND_CALL_SQL = (alias = "") => callSqlExprs(alias).outbound;
 const ANSWERED_CALL_SQL = (alias = "") => callSqlExprs(alias).connected;
 const ANSWERED_OUTBOUND_CALL_SQL = (alias = "") => callSqlExprs(alias).connectedOutbound;
@@ -265,12 +265,12 @@ function buildDefinitions(period) {
     },
     totalCalls: {
       label: "Total Calls",
-      formula: "All logged calls = Conversation (2 min+) + Short call (< 2 min) + Incoming short (< 2 min) + Not pick + Rejected + Missed (incoming)",
+      formula: "All logged calls = Conversation (> 2 min) + Short call (≤ 2 min) + Incoming short (≤ 2 min) + Not pick + Rejected + Missed (incoming)",
       basis: `Call date within ${basis}`,
     },
     qualifiedLeads: {
       label: "Qualified Leads",
-      formula: "Leads that reached a 2 min+ conversation, a booked meeting or any later stage",
+      formula: "Leads that reached a conversation above 2 min, a booked meeting or any later stage",
       basis: `Among ${created}`,
     },
     pipelineValue: {
@@ -290,7 +290,7 @@ function buildDefinitions(period) {
     },
     qualification: {
       label: "Qualification Rate",
-      formula: "Leads with a 2 min+ conversation or meeting booked (or later) / total leads",
+      formula: "Leads with a conversation above 2 min or meeting booked (or later) / total leads",
       basis: `Among ${created}`,
     },
     conversion: {

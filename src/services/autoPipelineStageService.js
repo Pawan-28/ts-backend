@@ -15,7 +15,7 @@ const EARLY_RANK = { lead: 0, not_pick: 1, short_call: 2, conversation_2min: 3 }
 
 /**
  * Stage id this single call implies, or null. Shared call definitions (utils/callMetrics.js):
- * Conversation (>= 2 min) -> conversation_2min, Short (answered outbound < 2 min) -> short_call,
+ * Conversation (> 120 s) -> conversation_2min, Short (answered outbound, 1-120 s) -> short_call,
  * Not pick (outbound, not answered) -> not_pick. Rejected, missed incoming and incoming short calls: no move.
  */
 function stageForCall(call) {

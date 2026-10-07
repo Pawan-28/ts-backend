@@ -3,11 +3,12 @@
  * Lead / Not Pick / Short Call / Conversation from what actually happened on the phone, instead of from a
  * stale stored stage or from only the calls of the selected period / current owner.
  *
- *   Conversation = answered, >= 2 min (any direction)
- *   Short Call   = answered OUTBOUND, < 2 min
- *   Not Pick     = OUTBOUND, not answered   (Rejected is its own bucket and never Not Pick)
+ *   Conversation = answered, above 2 min (> 120 s, any direction)
+ *   Short Call   = answered OUTBOUND, 1-120 s (exactly 120 s is Short)
+ *   Not Pick     = OUTBOUND, not answered  OR  an OUTBOUND call the customer REJECTED (rejectedOutbound)
+ *                  (in the call-category COUNTS Rejected is still its own bucket, separate from Not pick)
  *   Lead         = none of the above
- *   Missed (incoming), Rejected and Incoming short never move a lead out of Lead on their own.
+ *   Missed (incoming), a rejected INCOMING call and Incoming short never move a lead out of Lead on their own.
  *
  * The key is the last 10 digits of the lead's phone (the same key the Pipeline uses for "one card per phone"),
  * or "id:<leadId>" when the lead has no usable phone. Calls from ANY employee and ANY date are included.
@@ -28,7 +29,7 @@ function historyColumn(h) {
   if (!h) return "lead";
   if (h.conversation > 0) return "conversation_2min";
   if (h.short > 0) return "short_call";
-  if (h.noPickup > 0) return "not_pick";
+  if (h.noPickup > 0 || h.rejectedOutbound > 0) return "not_pick";
   return "lead";
 }
 
@@ -41,7 +42,7 @@ function furthestColumn(a, b) {
  * @param pool       mysql pool wrapper (config/db)
  * @param tenantId
  * @param {{ employeeId?: string|number }} opts  when given, only people who have a lead assigned to that employee
- * @returns {Promise<Object<string, {conversation:number, short:number, noPickup:number, rejected:number,
+ * @returns {Promise<Object<string, {conversation:number, short:number, noPickup:number, rejected:number, rejectedOutbound:number,
  *           missedIncoming:number, incomingShort:number, outbound:number, total:number, lastCallAt:string|null}>>}
  */
 async function loadCallHistory(pool, tenantId, { employeeId = null } = {}) {
@@ -62,6 +63,7 @@ async function loadCallHistory(pool, tenantId, { employeeId = null } = {}) {
             ${flag(x.short)} AS short_calls,
             ${flag(x.noPickup)} AS no_pickup,
             ${flag(x.rejected)} AS rejected,
+            ${flag(x.rejectedOutbound)} AS rejected_outbound,
             ${flag(x.missedIncoming)} AS missed_incoming,
             ${flag(x.incomingShort)} AS incoming_short,
             ${flag(x.outbound)} AS outbound,
@@ -80,6 +82,7 @@ async function loadCallHistory(pool, tenantId, { employeeId = null } = {}) {
       short: Number(r.short_calls) || 0,
       noPickup: Number(r.no_pickup) || 0,
       rejected: Number(r.rejected) || 0,
+      rejectedOutbound: Number(r.rejected_outbound) || 0,
       missedIncoming: Number(r.missed_incoming) || 0,
       incomingShort: Number(r.incoming_short) || 0,
       outbound: Number(r.outbound) || 0,

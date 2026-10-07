@@ -1,7 +1,9 @@
-/** Minimum answered call duration (seconds) counted as a conversation for KRA/incentives. */
-const CALL_CONVERSATION_MIN_SEC = 120;
-const CALL_CONVERSATION_LABEL = "2 min+";
-const CALL_SHORT_LABEL = "< 2 min";
+/** Short Call = answered talk time of 1-120 s INCLUSIVE; Conversation = answered talk time ABOVE 120 s. */
+const CALL_SHORT_MAX_SEC = 120;
+/** First whole second that counts as a Conversation (121 s). Used for 'duration greater than' API filters. */
+const CALL_CONVERSATION_MIN_SEC = CALL_SHORT_MAX_SEC + 1;
+const CALL_CONVERSATION_LABEL = "> 2 min";
+const CALL_SHORT_LABEL = "≤ 2 min";
 
 function parseCallDurationSeconds(durationStr) {
   if (durationStr == null || durationStr === "—") return 0;
@@ -22,7 +24,7 @@ function isConversationCall(durationOrSec) {
     typeof durationOrSec === "number"
       ? durationOrSec
       : parseCallDurationSeconds(durationOrSec);
-  return sec >= CALL_CONVERSATION_MIN_SEC;
+  return sec > CALL_SHORT_MAX_SEC;
 }
 
 function phonesMatchLoose(a, b) {
@@ -37,9 +39,9 @@ function phonesMatchLoose(a, b) {
  * (Product-owner decision.) The same definitions are used in Backend, Frontend, Dashboard, Call Reporting,
  * Pipeline and Incentives/KRA. Every call lands in exactly ONE bucket:
  *
- *   conversation     answered call, talk >= 2 min (120 s), any direction
- *   short            answered OUTBOUND call, talk < 2 min
- *   incoming_short   answered INCOMING call, talk < 2 min  (own bucket: counts as CONNECTED, not Short, not Not pick)
+ *   conversation     answered call, talk ABOVE 2 min (> 120 s), any direction
+ *   short            answered OUTBOUND call, talk 1-120 s (exactly 120 s is still Short)
+ *   incoming_short   answered INCOMING call, talk 1-120 s  (own bucket: counts as CONNECTED, not Short, not Not pick)
  *   no_pickup        OUTBOUND call the client did not answer ("Not pick")           - Rejected is NOT inside it
  *   rejected         rejected call                                                  - never inside Not pick
  *   missed_incoming  INCOMING call that was not answered ("Missed")
@@ -51,7 +53,7 @@ function phonesMatchLoose(a, b) {
  * NO substring / regex guessing of free text. The rule is EXACT lookups of the NORMALIZED outcome
  * (lower-case, trim, "_" and "-" -> space, collapse spaces) in the explicit sets below, plus direction,
  * plus duration:
- *   1. talk >= 120 s                                  -> conversation (an unanswered call cannot last 2 min)
+ *   1. talk > 120 s                                   -> conversation (an unanswered call cannot last 2 min)
  *   2. outcome in REJECTED set                        -> rejected
  *   3. talk > 0 and outcome NOT in any unanswered set -> answered (outcome "Connected", "Discovery complete",
  *                                                        or any unknown outcome that carries talk time):
@@ -116,7 +118,7 @@ function callDirection(call = {}) {
 /** @returns {"conversation"|"short"|"incoming_short"|"no_pickup"|"missed_incoming"|"rejected"} */
 function callBucket(call = {}) {
   const sec = callDurationSec(call);
-  if (sec >= CALL_CONVERSATION_MIN_SEC) return "conversation";
+  if (sec > CALL_SHORT_MAX_SEC) return "conversation";
   const outcome = normalizeCallOutcome(call.outcome);
   if (REJECTED_OUTCOMES.has(outcome)) return "rejected";
   const inbound = callDirection(call) === "inbound";
@@ -135,17 +137,31 @@ function isRejectedCall(call = {}) {
   return callBucket(call) === "rejected";
 }
 
-/** Answered OUTBOUND call under 2 min (the lead-stage "Short Call" rule). */
+/** Answered OUTBOUND call of 1-120 s (the lead-stage "Short Call" rule). */
 function isShortConnectedCall(call = {}) {
   return callBucket(call) === "short";
 }
 
-/** Answered INCOMING call under 2 min. */
+/** Answered INCOMING call of 1-120 s. */
 function isIncomingShortCall(call = {}) {
   return callBucket(call) === "incoming_short";
 }
 
 /** OUTBOUND call the client did not answer ("Not pick"). Rejected is NOT included. */
+/**
+ * A dial the CUSTOMER rejected (Rejected outcome on an OUTBOUND call). For the Pipeline COLUMN this counts as
+ * "Not Pick" - the customer did not take the call. In the call-category counts it stays its own bucket
+ * ("Rejected"), separate from "Not pick". A rejected INCOMING call (the rep declined it) moves nothing.
+ */
+function isCustomerRejectedDial(call = {}) {
+  return callBucket(call) === "rejected" && isOutboundCall(call);
+}
+
+/** Pipeline "Not Pick" column rule: outbound not answered, OR outbound rejected by the customer. */
+function isNotPickColumnCall(call = {}) {
+  return callBucket(call) === "no_pickup" || isCustomerRejectedDial(call);
+}
+
 function isNotPickupByClientCall(call = {}) {
   return callBucket(call) === "no_pickup";
 }
@@ -247,7 +263,7 @@ function callSqlExprs(alias = "ec") {
   const dur = `COALESCE(${p}duration_sec, 0)`;
   const outcomeNorm = `TRIM(REGEXP_REPLACE(REPLACE(REPLACE(LOWER(COALESCE(${p}outcome, '')), '_', ' '), '-', ' '), '[[:space:]]+', ' '))`;
   const dirInbound = `LOWER(TRIM(COALESCE(${p}direction, ''))) IN (${sqlList([...INBOUND_DIRECTIONS])})`;
-  const conversation = `(${dur} >= ${CALL_CONVERSATION_MIN_SEC})`;
+  const conversation = `(${dur} > ${CALL_SHORT_MAX_SEC})`;
   const rejected = `(NOT ${conversation} AND ${outcomeNorm} IN (${sqlList(OUTCOME_REJECTED)}))`;
   const unansweredOutcome = `${outcomeNorm} IN (${sqlList([...UNANSWERED_OUTCOMES])})`;
   const answeredBelow2 = `(NOT ${conversation} AND ${dur} > 0 AND NOT (${unansweredOutcome}))`;
@@ -267,6 +283,7 @@ function callSqlExprs(alias = "ec") {
     short,
     incomingShort,
     rejected,
+    rejectedOutbound: `(${rejected} AND NOT (${dirInbound}))`,
     missedIncoming,
     noPickup,
     outbound,
@@ -326,6 +343,7 @@ function dedupePeriodCalls(calls = []) {
 }
 
 module.exports = {
+  CALL_SHORT_MAX_SEC,
   CALL_CONVERSATION_MIN_SEC,
   CALL_CONVERSATION_LABEL,
   CALL_SHORT_LABEL,
@@ -339,6 +357,8 @@ module.exports = {
   isShortConnectedCall,
   isIncomingShortCall,
   isNotPickupByClientCall,
+  isCustomerRejectedDial,
+  isNotPickColumnCall,
   isMissedCall,
   isNotConnectedCall,
   isMissedIncomingCall,

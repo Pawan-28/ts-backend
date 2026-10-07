@@ -1,6 +1,7 @@
 const {
   callBucket,
   isNotPickupByClientCall,
+  isNotPickColumnCall,
   isOutboundCall,
   isShortConnectedCall,
   phonesMatchLoose,
@@ -201,8 +202,8 @@ function isUncontactedNewLead(lead, periodCalls = [], options = {}) {
 }
 
 // Pipeline column rules = the shared call definitions (utils/callMetrics.js):
-//   Conversation = answered, >= 2 min, any direction
-//   Short Call   = answered OUTBOUND < 2 min
+//   Conversation = answered, above 2 min (> 120 s), any direction
+//   Short Call   = answered OUTBOUND, 1-120 s (exactly 120 s is Short)
 //   Not Pick     = OUTBOUND call the client did not answer (Rejected is NOT Not Pick)
 // Rejected, Missed (incoming) and Incoming short calls never create a Not Pick / Short Call card.
 function leadHasConversation2MinPlus(calls = [], { outboundOnly = false } = {}) {
@@ -215,7 +216,7 @@ function leadHasConversation2MinPlus(calls = [], { outboundOnly = false } = {}) 
 function leadHasNotPickCall(calls = [], { outboundOnly = false } = {}) {
   return calls.some((c) => {
     if (outboundOnly && !isOutboundCall(c)) return false;
-    return isNotPickupByClientCall(c);
+    return isNotPickColumnCall(c);
   });
 }
 
@@ -251,7 +252,9 @@ function callKanbanColumn(call) {
     case "conversation": return "conversation_2min";
     case "short": return "short_call";
     case "no_pickup": return "not_pick";
-    default: return null; // rejected / missed incoming / incoming short: no stage move
+    // a dial the CUSTOMER rejected (outbound Rejected) -> Not Pick; a rejected INCOMING call (rep declined) moves nothing
+    case "rejected": return isOutboundCall(call || {}) ? "not_pick" : null;
+    default: return null; // missed incoming / incoming short: no stage move
   }
 }
 

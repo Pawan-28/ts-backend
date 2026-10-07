@@ -21,12 +21,12 @@ const p10 = (v) => { const d = String(v || "").replace(/\D/g, ""); return d.leng
     if (!k) continue;
     const shape = { durationSec: Number(c.duration_sec) || 0, outcome: c.outcome, direction: c.direction };
     const b = callBucket(shape);
-    const h = js[k] || (js[k] = { total: 0, conversation: 0, short: 0, noPickup: 0, rejected: 0, missedIncoming: 0, incomingShort: 0, outbound: 0 });
+    const h = js[k] || (js[k] = { total: 0, conversation: 0, short: 0, noPickup: 0, rejected: 0, rejectedOutbound: 0, missedIncoming: 0, incomingShort: 0, outbound: 0 });
     h.total += 1;
     if (b === "conversation") h.conversation += 1;
     else if (b === "short") h.short += 1;
     else if (b === "no_pickup") h.noPickup += 1;
-    else if (b === "rejected") h.rejected += 1;
+    else if (b === "rejected") { h.rejected += 1; if (isOutboundCall(shape)) h.rejectedOutbound += 1; }
     else if (b === "missed_incoming") h.missedIncoming += 1;
     else if (b === "incoming_short") h.incomingShort += 1;
     if (isOutboundCall(shape)) h.outbound += 1;
@@ -34,7 +34,7 @@ const p10 = (v) => { const d = String(v || "").replace(/\D/g, ""); return d.leng
 
   // SQL side (tenant-wide, and per-employee scope must be a subset with identical numbers)
   const sql = await loadCallHistory(pool, "default");
-  const fields = ["total", "conversation", "short", "noPickup", "rejected", "missedIncoming", "incomingShort", "outbound"];
+  const fields = ["total", "conversation", "short", "noPickup", "rejected", "rejectedOutbound", "missedIncoming", "incomingShort", "outbound"];
   let bad = 0; const examples = [];
   const keys = new Set([...Object.keys(js), ...Object.keys(sql)]);
   for (const k of keys) {

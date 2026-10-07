@@ -3,7 +3,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { historyColumn, furthestColumn, personKeySql, HISTORY_COLUMN_RANK } = require("./callHistory");
 
-const h = (o = {}) => ({ conversation: 0, short: 0, noPickup: 0, rejected: 0, missedIncoming: 0, incomingShort: 0, ...o });
+const h = (o = {}) => ({ conversation: 0, short: 0, noPickup: 0, rejected: 0, rejectedOutbound: 0, missedIncoming: 0, incomingShort: 0, ...o });
 
 test("priority: Conversation > Short Call > Not Pick > Lead", () => {
   assert.equal(historyColumn(null), "lead");
@@ -14,13 +14,19 @@ test("priority: Conversation > Short Call > Not Pick > Lead", () => {
   assert.equal(historyColumn(h({ conversation: 1, short: 4, noPickup: 9 })), "conversation_2min");
 });
 
-test("Rejected, Missed (incoming) and Incoming short never leave Lead on their own", () => {
-  assert.equal(historyColumn(h({ rejected: 3 })), "lead");
+test("a dial the CUSTOMER rejected (outbound Rejected) puts the lead in Not Pick", () => {
+  assert.equal(historyColumn(h({ rejected: 1, rejectedOutbound: 1 })), "not_pick");
+  assert.equal(historyColumn(h({ rejected: 4, rejectedOutbound: 4 })), "not_pick");
+  // answered calls still outrank it
+  assert.equal(historyColumn(h({ rejectedOutbound: 2, short: 1 })), "short_call");
+  assert.equal(historyColumn(h({ rejectedOutbound: 2, conversation: 1 })), "conversation_2min");
+});
+
+test("a rejected INCOMING call, Missed (incoming) and Incoming short never leave Lead on their own", () => {
+  assert.equal(historyColumn(h({ rejected: 3, rejectedOutbound: 0 })), "lead"); // rejected, but not an outbound dial
   assert.equal(historyColumn(h({ missedIncoming: 2 })), "lead");
   assert.equal(historyColumn(h({ incomingShort: 4 })), "lead");
   assert.equal(historyColumn(h({ rejected: 3, missedIncoming: 2, incomingShort: 4 })), "lead");
-  // ...but one real unanswered dial next to a rejected one is Not Pick (from the unanswered dial only)
-  assert.equal(historyColumn(h({ rejected: 3, noPickup: 1 })), "not_pick");
 });
 
 test("furthestColumn keeps a stored stage that is further along than the history", () => {

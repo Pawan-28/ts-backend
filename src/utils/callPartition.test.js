@@ -32,8 +32,8 @@ function assertPartition(s, label = "") {
 const SYNTHETIC = [
   // Answered, outbound
   { id: 1, leadId: 10, direction: "outbound", outcome: "Connected", durationSec: 400 }, // conversation
-  { id: 2, leadId: 10, direction: "outbound", outcome: "Connected", durationSec: 120 }, // conversation (boundary)
-  { id: 3, leadId: 11, direction: "outbound", outcome: "Connected", durationSec: 119 }, // short (boundary)
+  { id: 2, leadId: 10, direction: "outbound", outcome: "Connected", durationSec: 121 }, // conversation (boundary: first second above 120)
+  { id: 3, leadId: 11, direction: "outbound", outcome: "Connected", durationSec: 120 }, // short (boundary: exactly 120 s is still Short)
   { id: 4, leadId: 11, direction: "outbound", outcome: "Connected", durationSec: 3 }, // short
   // Answered, INBOUND under 2 min: its own bucket (incoming_short) - not Short, not Not pick
   { id: 5, leadId: 12, direction: "inbound", outcome: "Connected", durationSec: 45 },
@@ -154,9 +154,14 @@ test("outcome normalisation: case, spaces, underscores, hyphens", () => {
   assert.equal(b("outbound", "Not-Connected", 4), "no_pickup");
 });
 
-test("talk >= 120 s is always a conversation, whatever the outcome text says", () => {
+test("talk > 120 s is always a conversation, whatever the outcome text says; exactly 120 s is not", () => {
   assert.equal(b("outbound", "Not Connected", 130), "conversation");
-  assert.equal(b("inbound", "Missed", 120), "conversation");
+  assert.equal(b("inbound", "Missed", 121), "conversation");
+  assert.equal(b("outbound", "Connected", 120), "short");
+  assert.equal(b("outbound", "Connected", 119), "short");
+  assert.equal(b("outbound", "Connected", 121), "conversation");
+  assert.equal(b("inbound", "Connected", 120), "incoming_short");
+  assert.equal(b("inbound", "Connected", 121), "conversation");
 });
 
 test("ring-time on a 'Not Connected' dial is not a connected call and adds no talk time", () => {
@@ -211,9 +216,16 @@ test("legacy helpers agree with the partition", () => {
   }
 });
 
-test("pipeline columns: Not Pick = no_pickup only; Short = answered outbound short; rejected/missed/incoming short move nothing", () => {
+test("pipeline columns: Not Pick = unanswered outbound OR an outbound dial the customer rejected; Short = answered outbound 1-120 s; missed / rejected-incoming / incoming short move nothing", () => {
   assert.equal(callKanbanColumn({ direction: "outbound", outcome: "Not Connected", durationSec: 0 }), "not_pick");
-  assert.equal(callKanbanColumn({ direction: "outbound", outcome: "Rejected", durationSec: 0 }), null);
+  // customer rejected our dial -> Not Pick for the column (in the call COUNTS it stays its own "Rejected" bucket)
+  assert.equal(callKanbanColumn({ direction: "outbound", outcome: "Rejected", durationSec: 0 }), "not_pick");
+  assert.equal(callKanbanColumn({ direction: "inbound", outcome: "Rejected", durationSec: 0 }), null); // rep declined an incoming call
+  assert.equal(callKanbanColumn({ direction: "outbound", outcome: "Connected", durationSec: 1 }), "short_call");
+  assert.equal(callKanbanColumn({ direction: "outbound", outcome: "Connected", durationSec: 119 }), "short_call");
+  assert.equal(callKanbanColumn({ direction: "outbound", outcome: "Connected", durationSec: 120 }), "short_call"); // exactly 120 s is Short
+  assert.equal(callKanbanColumn({ direction: "outbound", outcome: "Connected", durationSec: 121 }), "conversation_2min");
+  assert.equal(callKanbanColumn({ direction: "outbound", outcome: "Not Connected", durationSec: 5 }), "not_pick"); // ring-only is not a Short Call
   assert.equal(callKanbanColumn({ direction: "inbound", outcome: "Missed", durationSec: 0 }), null);
   assert.equal(callKanbanColumn({ direction: "inbound", outcome: "Connected", durationSec: 45 }), null);
   assert.equal(callKanbanColumn({ direction: "outbound", outcome: "Connected", durationSec: 45 }), "short_call");
