@@ -1403,12 +1403,17 @@ router.get("/employee/:employeeId/meetings", requireEmployeeSelf(), asyncRoute(a
   const meetings = await repo.listMeetings(tenant(req), req.params.employeeId, { includeAssignedLeads: true });
   // `isActive` / `lifecycle` on every row come from the backend (utils/activeMeetings). `meta` lets the page prove it matches
   // the Pipeline: active meetings vs Meeting Booked cards, and the cards that have no meeting yet.
-  const bookedWithoutMeeting = await repo.listMeetingBookedLeadsWithoutActiveMeeting(tenant(req), req.params.employeeId, meetings);
+  const [bookedWithoutMeeting, doneWithoutMeeting] = await Promise.all([
+    repo.listMeetingBookedLeadsWithoutActiveMeeting(tenant(req), req.params.employeeId, meetings),
+    repo.listMeetingDoneLeadsWithoutMeeting(tenant(req), req.params.employeeId, meetings),
+  ]);
   return ok(res, meetings, {
     meta: {
       activeCount: meetings.filter((m) => m.isActive).length,
       historyCount: meetings.filter((m) => !m.isActive).length,
+      // Pipeline cards that have no meeting record - the Meetings page lists them too so both screens match card for card.
       bookedWithoutMeeting,
+      doneWithoutMeeting,
     },
   });
 }));

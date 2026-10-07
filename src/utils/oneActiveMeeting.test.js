@@ -211,3 +211,29 @@ test("source guard: the Meetings API and the Pipeline board both use the shared 
   assert.match(board, /boardMeetings\(allMeetings\)/);
   assert.match(board, /includeAssignedLeads: true/, "the board loads the same meeting set as the Meetings page");
 });
+
+/* ───────── Pipeline cards with no meeting record are still listed on the Meetings page ───────── */
+const { leadsWithoutMeeting } = require("./activeMeetings");
+
+test("Meeting Booked / Meeting Done leads with no meeting record are returned so the page can list them (same cards as the Pipeline)", () => {
+  const leads = [
+    { id: 1, phone: "9000000001", stage: "Meeting Booked", status: "Meeting Booked" },   // has an active meeting
+    { id: 2, phone: "9000000002", stage: "booked", status: "New Lead" },                  // stage only
+    { id: 3, phone: "9000000003", stage: "Meeting Done", status: "Meeting Done" },        // has a completed meeting
+    { id: 4, phone: "9000000004", stage: "Meeting Done", status: "Meeting Done" },        // stage only
+    { id: 5, phone: "9000000005", stage: "Meeting Done", status: "Meeting Done" },        // only a SCHEDULED meeting -> still needs a held record
+    { id: 6, phone: "9000000006", stage: "Conversation", status: "Conversation" },        // neither
+  ];
+  const base = { employeeId: 5, leadStage: "x", leadAssignedTo: 5, scheduledAt: "2026-10-09T10:00:00" };
+  const annotated = [
+    { ...base, id: 11, leadId: 1, leadPhone: "9000000001", status: "scheduled", isActive: true },
+    { ...base, id: 13, leadId: 3, leadPhone: "9000000003", status: "completed", isActive: false },
+    { ...base, id: 15, leadId: 5, leadPhone: "9000000005", status: "scheduled", isActive: false },
+  ];
+  assert.deepEqual(leadsWithoutMeeting(leads, annotated, "meeting_booked").map((l) => l.id), [2]);
+  assert.deepEqual(leadsWithoutMeeting(leads, annotated, "meeting_done").map((l) => l.id), [4, 5]);
+  // one customer with two lead records: covered once, listed once
+  const dupLeads = [{ id: 7, phone: "+91 90000 00007", stage: "Meeting Booked", status: "x" }, { id: 8, phone: "9000000007", stage: "Meeting Booked", status: "x" }];
+  const cover = [{ ...base, id: 21, leadId: 7, leadPhone: "9000000007", status: "scheduled", isActive: true }];
+  assert.deepEqual(leadsWithoutMeeting(dupLeads, cover, "meeting_booked"), [], "same phone is the same customer");
+});

@@ -54,6 +54,24 @@ function pickCurrentMeeting(candidates) {
 }
 
 /**
+ * PIPELINE CARDS WITH NO MEETING RECORD. A lead can sit in Meeting Booked / Meeting Done with no meeting row (legacy stage, or a
+ * customer booking that carried no date). The Meetings page must still list it - otherwise Pipeline and Meetings can never match.
+ *   stageId "meeting_booked": leads in Meeting Booked that have no ACTIVE meeting
+ *   stageId "meeting_done"  : leads in Meeting Done that have no COMPLETED meeting
+ * `leads`: [{ id, name, phone, company, service, stage, status }], `annotated`: the annotated meetings of the same viewer.
+ */
+function leadsWithoutMeeting(leads = [], annotated = [], stageId = "meeting_booked") {
+  const covered = new Set(
+    annotated
+      .filter((m) => (stageId === "meeting_done" ? m.status === "completed" : m.isActive))
+      .map((m) => meetingPersonKey(m)),
+  );
+  return leads
+    .filter((l) => mapStageToId(l.stage, l.status) === stageId)
+    .filter((l) => !covered.has(meetingPersonKey({ leadId: l.id, leadPhone: l.phone })));
+}
+
+/**
  * Is `existing` a scheduled row that a NEWER booking of the same customer replaced? Returns the customer's current meeting when
  * so (the one to reschedule instead), else null. `siblings` = the customer's scheduled meetings (may include `existing`).
  */
@@ -151,6 +169,7 @@ module.exports = {
   wallClockNow,
   pickCurrentMeeting,
   supersedingMeeting,
+  leadsWithoutMeeting,
   boardMeetings,
   annotateActiveMeetings,
   activeOnly,

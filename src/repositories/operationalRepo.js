@@ -1591,18 +1591,33 @@ async function listTenantMeetings(tenantId, options = {}) {
  * page cannot show (nothing to schedule): the rep must book / reschedule a meeting for them.
  */
 async function listMeetingBookedLeadsWithoutActiveMeeting(tenantId, employeeId, annotatedMeetings = []) {
-  const { isMeetingBookedStage, meetingPersonKey } = require("../utils/activeMeetings");
+  return listPipelineLeadsWithoutMeeting(tenantId, employeeId, annotatedMeetings, "meeting_booked");
+}
+
+/** Leads assigned to this employee in Meeting Done with no COMPLETED meeting (Pipeline cards the History list cannot show). */
+async function listMeetingDoneLeadsWithoutMeeting(tenantId, employeeId, annotatedMeetings = []) {
+  return listPipelineLeadsWithoutMeeting(tenantId, employeeId, annotatedMeetings, "meeting_done");
+}
+
+async function listPipelineLeadsWithoutMeeting(tenantId, employeeId, annotatedMeetings, stageId) {
+  const { leadsWithoutMeeting } = require("../utils/activeMeetings");
+  // SQL only narrows the candidates; the stage decision is the shared mapping (utils/pipelineStages) in leadsWithoutMeeting().
+  const patterns = stageId === "meeting_done" ? ["%done%", "%show%"] : ["%book%"];
+  const clauses = patterns
+    .map((_, i) => `LOWER(COALESCE(pipeline_stage, '')) LIKE $${i + 3} OR LOWER(COALESCE(status, '')) LIKE $${i + 3}`)
+    .join(" OR ");
   const result = await pool.query(
-    `SELECT id, lead_name, phone, pipeline_stage, status FROM leads
-     WHERE tenant_id = $1 AND assigned_to = $2 AND is_deleted = 0
-       AND (LOWER(COALESCE(pipeline_stage, '')) LIKE '%book%' OR LOWER(COALESCE(status, '')) LIKE '%book%')`,
-    [tenantId, employeeId],
+    `SELECT id, lead_name, phone, email, company_name, form_name, pipeline_stage, status, expected_revenue FROM leads
+     WHERE tenant_id = $1 AND assigned_to = $2 AND is_deleted = 0 AND (${clauses})`,
+    [tenantId, employeeId, ...patterns],
   );
-  const activeKeys = new Set(annotatedMeetings.filter((m) => m.isActive).map(meetingPersonKey));
-  return result.rows
-    .filter((l) => isMeetingBookedStage(l.pipeline_stage, l.status))
-    .filter((l) => !activeKeys.has(meetingPersonKey({ leadId: l.id, leadPhone: l.phone })))
-    .map((l) => ({ leadId: l.id, name: l.lead_name, stage: l.pipeline_stage }));
+  const leads = result.rows.map((l) => ({
+    id: l.id, name: l.lead_name, phone: l.phone, email: l.email, company: l.company_name, service: l.form_name,
+    stage: l.pipeline_stage, status: l.status, expectedRevenue: Number(l.expected_revenue || 0),
+  }));
+  return leadsWithoutMeeting(leads, annotatedMeetings, stageId).map((l) => ({
+    leadId: l.id, name: l.name, phone: l.phone, email: l.email, company: l.company, service: l.service, stage: l.stage, expectedRevenue: l.expectedRevenue,
+  }));
 }
 
 /** Scheduled (not completed / cancelled) meetings of ONE lead, oldest first. Used by the booking and stage-exit rules. */
@@ -2116,6 +2131,7 @@ module.exports = {
   listMeetings,
   listScheduledMeetingsForLead,
   listMeetingBookedLeadsWithoutActiveMeeting,
+  listMeetingDoneLeadsWithoutMeeting,
   listScheduledMeetingsForPhone,
   setScheduledMeetingsStatus,
   listTenantMeetings,
