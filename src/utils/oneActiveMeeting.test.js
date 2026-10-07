@@ -237,3 +237,12 @@ test("Meeting Booked / Meeting Done leads with no meeting record are returned so
   const cover = [{ ...base, id: 21, leadId: 7, leadPhone: "9000000007", status: "scheduled", isActive: true }];
   assert.deepEqual(leadsWithoutMeeting(dupLeads, cover, "meeting_booked"), [], "same phone is the same customer");
 });
+
+test("one card per customer: two lead records with the same phone and no meeting are listed ONCE (the Pipeline shows one card per phone)", () => {
+  const leads = [
+    { id: 41, phone: "+91 98887 77666", stage: "booked", status: "Booked" },
+    { id: 42, phone: "919888777666", stage: "booked", status: "New Lead" },
+    { id: 43, phone: "9111122222", stage: "Meeting Booked", status: "Meeting Booked" },
+  ];
+  assert.deepEqual(leadsWithoutMeeting(leads, [], "meeting_booked").map((l) => l.id), [41, 43]);
+});

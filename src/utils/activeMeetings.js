@@ -66,9 +66,15 @@ function leadsWithoutMeeting(leads = [], annotated = [], stageId = "meeting_book
       .filter((m) => (stageId === "meeting_done" ? m.status === "completed" : m.isActive))
       .map((m) => meetingPersonKey(m)),
   );
+  const listed = new Set();
   return leads
     .filter((l) => mapStageToId(l.stage, l.status) === stageId)
-    .filter((l) => !covered.has(meetingPersonKey({ leadId: l.id, leadPhone: l.phone })));
+    .filter((l) => {
+      const key = meetingPersonKey({ leadId: l.id, leadPhone: l.phone });
+      if (covered.has(key) || listed.has(key)) return false; // covered by a meeting, or this customer is already listed
+      listed.add(key);
+      return true;
+    });
 }
 
 /**
