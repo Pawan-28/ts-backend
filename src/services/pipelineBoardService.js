@@ -3,6 +3,7 @@ const repo = require("../repositories/operationalRepo");
 const callyzer = require("./callyzerService");
 const { queryCallStats } = require("../utils/employeeCallStats");
 const { dedupePeriodCalls } = require("../utils/callMetrics");
+const { boardMeetings } = require("../utils/activeMeetings");
 const { filterCallsForPeriod } = require("../utils/periodDateKeys");
 const {
   groupEmpLeadsKanban,
@@ -138,7 +139,7 @@ async function buildPipelineBoardPayload(tenantId, {
   // Same ACTIVE-meeting definition as the Meetings page (utils/activeMeetings): a still-"scheduled" meeting whose lead is no
   // longer in Meeting Booked, that was replaced by a newer one, or that belongs to another employee's lead is NOT sent to the
   // board, so it can neither create nor keep a Meeting Booked card. Completed meetings stay (they place Meeting Done).
-  const meetings = allMeetings.filter((m) => m.status !== "scheduled" || m.isActive !== false);
+  const meetings = boardMeetings(allMeetings);
 
   let leads;
   if (useFullAttach) {

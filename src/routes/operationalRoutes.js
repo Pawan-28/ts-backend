@@ -68,6 +68,7 @@ const {
 const callyzer = require("../services/callyzerService");
 const n8nWebhookService = require("../services/n8nWebhookService");
 const meetingSync = require("../services/meetingSyncService");
+const { supersedingMeeting } = require("../utils/activeMeetings");
 const { logger } = require("../config/logger");
 const {
   buildPipelineBoardPayload,
@@ -1339,6 +1340,17 @@ router.patch("/employee/meetings/:id", validate(meetingPatchSchema), asyncRoute(
   const movingHistory = req.body.scheduledAt !== undefined && existing.status !== "scheduled" && !reactivating;
   if (movingHistory) {
     return res.status(409).json({ success: false, message: `This meeting is ${existing.status} - book a new meeting or reschedule the active one.` });
+  }
+  // A "scheduled" row that a newer booking replaced (superseded) cannot be rescheduled directly - that would silently swap which
+  // meeting is the customer's current one. The current meeting is the one to reschedule.
+  const movesTime = req.body.scheduledAt !== undefined || req.body.meetLink !== undefined;
+  if (movesTime && existing.status === "scheduled" && !reactivating) {
+    const lead = await repo.findLeadById(tenantId, existing.leadId).catch(() => null);
+    const siblings = lead ? await meetingSync.findExistingScheduledForCustomer(tenantId, lead) : [];
+    const current = supersedingMeeting(existing, siblings);
+    if (current) {
+      return res.status(409).json({ success: false, message: `This customer's current meeting is #${current.id} - reschedule that one.`, currentMeetingId: current.id });
+    }
   }
   if (reactivating) {
     const lead = await repo.findLeadById(tenantId, existing.leadId).catch(() => null);

@@ -7,7 +7,9 @@
  *   2. its lead is not deleted and is CURRENTLY in Meeting Booked (any lead stage / status label that maps to meeting_booked)
  *   3. it belongs to the lead's assignee (an unassigned lead falls back to the meeting's own employee)  [viewer filter]
  *   4. it is the CURRENT meeting of that customer: ONE active meeting per customer (person key = last 10 digits of the
- *      phone, else the lead id). The current one is the soonest upcoming meeting, else the most recent past one.
+ *      phone, else the lead id). The current one is the MOST RECENT BOOKING (highest id): a customer who books or moves a
+ *      meeting to another time replaces the old one, whatever the old / new times are (2 PM -> 8:30 PM keeps 8:30 PM,
+ *      and 12 Oct -> 9 Oct keeps 9 Oct). A reschedule updates the SAME row, so its id - and its place as "current" - never changes.
  * Everything else is HISTORY with a `lifecycle` explaining why (completed | cancelled | stage_moved | superseded |
  * lead_deleted | other_owner). Nothing is ever deleted.
  *
@@ -42,15 +44,30 @@ function wallClockNow(now = Date.now()) {
 
 const wall = (v) => String(v == null ? "" : v).replace(" ", "T").slice(0, 19);
 
-/** Current meeting of one customer among scheduled candidates: soonest upcoming, else most recent past. */
-function pickCurrentMeeting(candidates, now = Date.now()) {
+/**
+ * Current meeting of one customer among scheduled candidates = the MOST RECENT BOOKING (highest id).
+ * (Not "soonest" - a customer who moves 2 PM to 8:30 PM, both still upcoming, wants 8:30 PM.)
+ */
+function pickCurrentMeeting(candidates) {
   if (!candidates.length) return null;
-  const nowWall = wallClockNow(now);
-  const upcoming = candidates
-    .filter((m) => wall(m.scheduledAt) >= nowWall)
-    .sort((a, b) => wall(a.scheduledAt).localeCompare(wall(b.scheduledAt)) || Number(a.id) - Number(b.id));
-  if (upcoming.length) return upcoming[0];
-  return [...candidates].sort((a, b) => wall(b.scheduledAt).localeCompare(wall(a.scheduledAt)) || Number(b.id) - Number(a.id))[0];
+  return [...candidates].sort((a, b) => Number(b.id) - Number(a.id))[0];
+}
+
+/**
+ * Is `existing` a scheduled row that a NEWER booking of the same customer replaced? Returns the customer's current meeting when
+ * so (the one to reschedule instead), else null. `siblings` = the customer's scheduled meetings (may include `existing`).
+ */
+function supersedingMeeting(existing, siblings = []) {
+  const current = pickCurrentMeeting(siblings);
+  return current && String(current.id) !== String(existing.id) && Number(current.id) > Number(existing.id) ? current : null;
+}
+
+/**
+ * The meetings the Pipeline board receives: exactly the Meetings page's active set + the history it needs (completed meetings
+ * place Meeting Done). A "scheduled" meeting that is not active never reaches the board. ONE function, used by both sides.
+ */
+function boardMeetings(annotated = []) {
+  return annotated.filter((m) => m.status !== "scheduled" || m.isActive !== false);
 }
 
 /**
@@ -86,7 +103,7 @@ function annotateActiveMeetings(meetings = [], { now = Date.now(), viewerEmploye
   }
 
   for (const group of eligible.values()) {
-    const current = pickCurrentMeeting(group, now);
+    const current = pickCurrentMeeting(group);
     for (const m of group) {
       out.set(m, m === current
         ? { ...m, isActive: true, lifecycle: "active" }
@@ -122,8 +139,8 @@ function meetingStageTransition(before = {}, after = {}) {
  * Booking rule: one active meeting per customer. Given the customer's existing SCHEDULED meetings, decide whether a new
  * booking inserts a row or reschedules the existing one. With several legacy rows the CURRENT one is rescheduled.
  */
-function planBooking(existingScheduled = [], now = Date.now()) {
-  const current = pickCurrentMeeting(existingScheduled, now);
+function planBooking(existingScheduled = []) {
+  const current = pickCurrentMeeting(existingScheduled);
   return current ? { action: "reschedule", meetingId: current.id, existing: current } : { action: "insert" };
 }
 
@@ -133,6 +150,8 @@ module.exports = {
   meetingPersonKey,
   wallClockNow,
   pickCurrentMeeting,
+  supersedingMeeting,
+  boardMeetings,
   annotateActiveMeetings,
   activeOnly,
   meetingExitStatus,

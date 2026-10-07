@@ -963,29 +963,37 @@ async function createMeeting({ tenantId, data, actor: a }) {
   const isGoogleMeet = location.includes("google meet");
   const meetLink = String(payload.meetLink || "").trim();
 
-  // ONE CUSTOMER = ONE ACTIVE MEETING. If this lead (or another record with the same phone) already has a scheduled
-  // meeting, a new booking RESCHEDULES that meeting (same row, new date/time) instead of inserting a second one.
+  // ONE CUSTOMER = ONE ACTIVE MEETING. This is the ONLY place a meeting row is inserted (every booking path - manual, drawer,
+  // Follow-Ups, Pipeline drag, webhook - comes through here). If this lead (or another record with the same phone) already has
+  // a scheduled meeting, the booking RESCHEDULES it (same row, new date/time) instead of inserting a second one.
   const bookingLead = await repo.findLeadById(tenantId, payload.leadId).catch(() => null);
-  const plan = bookingLead ? await meetingSync.planCustomerBooking(tenantId, bookingLead) : { action: "insert" };
-  if (plan.action === "reschedule") {
-    return rescheduleExistingMeeting({ tenantId, existing: plan.existing, payload, a });
+  const booking = await meetingSync.bookForCustomer({
+    tenantId,
+    lead: bookingLead,
+    payload,
+    updateMeeting: (id, patch) => repo.updateMeeting(tenantId, id, patch),
+    insertMeeting: async (p) => {
+      const next = { ...p };
+      if (isGoogleMeet && !meetLink) {
+        if (!googleMeet.isConfigured()) {
+          const err = new Error("Google Meet is not configured on the server");
+          err.status = 503;
+          throw err;
+        }
+        next.meetLink = await googleMeet.createMeetLink({
+          employeeId: next.employeeId,
+          title: next.title,
+          scheduledAt: next.scheduledAt,
+          durationMin: next.durationMin || 30,
+        });
+      }
+      return repo.insertMeeting({ tenantId, ...next });
+    },
+  });
+  if (booking.rescheduled) {
+    return recordMeetingRescheduled({ tenantId, existing: booking.existing, meeting: booking.meeting, a });
   }
-
-  if (isGoogleMeet && !meetLink) {
-    if (!googleMeet.isConfigured()) {
-      const err = new Error("Google Meet is not configured on the server");
-      err.status = 503;
-      throw err;
-    }
-    payload.meetLink = await googleMeet.createMeetLink({
-      employeeId: payload.employeeId,
-      title: payload.title,
-      scheduledAt: payload.scheduledAt,
-      durationMin: payload.durationMin || 30,
-    });
-  }
-
-  const meeting = await repo.insertMeeting({ tenantId, ...payload });
+  const meeting = booking.meeting;
   await writeTimeline({
     tenantId,
     leadId: data.leadId,
@@ -1010,19 +1018,8 @@ async function createMeeting({ tenantId, data, actor: a }) {
   return meeting;
 }
 
-/** A repeat booking for a customer who already has an active meeting: update THAT meeting, never insert another. */
-async function rescheduleExistingMeeting({ tenantId, existing, payload, a }) {
-  const patch = {
-    scheduledAt: payload.scheduledAt,
-    durationMin: payload.durationMin || existing.durationMin || undefined,
-    title: payload.title || existing.title || undefined,
-    location: payload.location || existing.location || undefined,
-    // A Meet link does not depend on the time, so keep the existing one unless the booking brought a new link.
-    meetLink: String(payload.meetLink || "").trim() || existing.meetLink || undefined,
-    agenda: payload.agenda || undefined,
-  };
-  for (const k of Object.keys(patch)) if (patch[k] === undefined) delete patch[k];
-  const meeting = await repo.updateMeeting(tenantId, existing.id, patch);
+/** Timeline + notification for a repeat booking that rescheduled the customer's existing meeting (the row is already updated). */
+async function recordMeetingRescheduled({ tenantId, existing, meeting, a }) {
   await writeTimeline({
     tenantId,
     leadId: existing.leadId,
@@ -1044,7 +1041,7 @@ async function rescheduleExistingMeeting({ tenantId, existing, payload, a }) {
   } catch {
     // Meeting is already saved - a notification failure must not fail the request.
   }
-  return { ...meeting, rescheduled: true, previousScheduledAt: existing.scheduledAt };
+  return meeting;
 }
 
 async function addMom({ tenantId, meetingId, mom, actor: a }) {

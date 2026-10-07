@@ -48,21 +48,33 @@ test("completed / cancelled meetings are history and never active, even while th
   assert.deepEqual(out.map((x) => x.lifecycle), ["completed", "cancelled"]);
 });
 
-test("two scheduled meetings for one customer -> only the CURRENT one is active (soonest upcoming), the rest are superseded", () => {
+test("two scheduled meetings for one customer -> only the CURRENT one (most recent booking) is active, the rest are superseded", () => {
   const rows = [
     m({ id: 1, scheduledAt: "2026-10-12T10:00:00" }),
     m({ id: 2, scheduledAt: "2026-10-09T10:00:00" }),
     m({ id: 3, scheduledAt: PAST }),
   ];
   const out = annotateActiveMeetings(rows, { now: NOW });
-  assert.deepEqual(activeOnly(out).map((x) => x.id), [2]);
-  assert.deepEqual(out.filter((x) => x.lifecycle === "superseded").map((x) => x.id).sort(), [1, 3]);
-  assert.ok(out.filter((x) => x.lifecycle === "superseded").every((x) => x.supersededBy === 2));
+  assert.deepEqual(activeOnly(out).map((x) => x.id), [3], "highest id = latest booking, whatever its date");
+  assert.deepEqual(out.filter((x) => x.lifecycle === "superseded").map((x) => x.id).sort(), [1, 2]);
+  assert.ok(out.filter((x) => x.lifecycle === "superseded").every((x) => x.supersededBy === 3));
 });
 
-test("with no upcoming meeting the most recent past one is the current (overdue) meeting", () => {
-  const out = annotateActiveMeetings([m({ id: 1, scheduledAt: "2026-09-01T10:00:00" }), m({ id: 2, scheduledAt: PAST })], { now: NOW });
+test("2 PM -> 8:30 PM: both still upcoming, the customer's LATER booking (8:30 PM) is the active one - not the soonest", () => {
+  const rows = [m({ id: 10, scheduledAt: "2026-10-09T14:00:00" }), m({ id: 11, scheduledAt: "2026-10-09T20:30:00" })];
+  const out = annotateActiveMeetings(rows, { now: NOW });
+  assert.deepEqual(activeOnly(out).map((x) => x.id), [11]);
+  assert.equal(out[0].lifecycle, "superseded");
+  // and the other way round: a customer who moved a meeting EARLIER keeps the earlier one
+  const rows2 = [m({ id: 10, scheduledAt: "2026-10-12T10:00:00" }), m({ id: 11, scheduledAt: "2026-10-09T10:00:00" })];
+  assert.deepEqual(activeOnly(annotateActiveMeetings(rows2, { now: NOW })).map((x) => x.id), [11]);
+});
+
+test("both past (overdue): still exactly one active card for the customer - the latest booking", () => {
+  const rows = [m({ id: 1, scheduledAt: "2026-10-06T14:00:00" }), m({ id: 2, scheduledAt: "2026-10-06T20:30:00" })];
+  const out = annotateActiveMeetings(rows, { now: NOW });
   assert.deepEqual(activeOnly(out).map((x) => x.id), [2]);
+  assert.equal(out[0].lifecycle, "superseded");
 });
 
 test("one customer = one meeting ACROSS lead records that share a phone (last 10 digits)", () => {
@@ -117,11 +129,11 @@ test("stage transition detection", () => {
 });
 
 test("booking plan: no meeting -> insert; existing scheduled meeting -> reschedule THAT one (the current one)", () => {
-  assert.deepEqual(planBooking([], NOW), { action: "insert" });
-  const plan = planBooking([m({ id: 4, scheduledAt: "2026-10-12T10:00:00" }), m({ id: 7, scheduledAt: "2026-10-09T10:00:00" })], NOW);
+  assert.deepEqual(planBooking([]), { action: "insert" });
+  const plan = planBooking([m({ id: 4, scheduledAt: "2026-10-12T10:00:00" }), m({ id: 7, scheduledAt: "2026-10-09T10:00:00" })]);
   assert.equal(plan.action, "reschedule");
-  assert.equal(plan.meetingId, 7);
-  assert.equal(pickCurrentMeeting([], NOW), null);
+  assert.equal(plan.meetingId, 7, "the most recent booking is the one rescheduled");
+  assert.equal(pickCurrentMeeting([]), null);
 });
 
 /* ───────── lifecycle simulation: the real service functions on an in-memory store ───────── */

@@ -17,6 +17,21 @@ const {
   meetingPersonKey,
 } = require("../utils/activeMeetings");
 
+/** The fields of an existing meeting that a repeat booking overwrites (same row, new time). Pure. */
+function buildReschedulePatch(existing, payload) {
+  const patch = {
+    scheduledAt: payload.scheduledAt,
+    durationMin: payload.durationMin || existing.durationMin || undefined,
+    title: payload.title || existing.title || undefined,
+    location: payload.location || existing.location || undefined,
+    // A Meet link does not depend on the time, so keep the existing one unless the booking brought a new link.
+    meetLink: String(payload.meetLink || "").trim() || existing.meetLink || undefined,
+    agenda: payload.agenda || undefined,
+  };
+  for (const k of Object.keys(patch)) if (patch[k] === undefined) delete patch[k];
+  return patch;
+}
+
 const defaultRepo = () => require("../repositories/operationalRepo");
 
 class MeetingRequiredError extends Error {
@@ -51,6 +66,25 @@ function createMeetingSync(getRepo = defaultRepo) {
   }
 
   /**
+   * THE booking rule, used by EVERY way of booking (manual Meetings page, lead drawer / modal, Follow-Ups, Pipeline drag, and
+   * the landing-page / n8n webhook all end in operationalServices.createMeeting -> here): if the customer already has a
+   * scheduled meeting, UPDATE that meeting (same id); only a customer with none gets a new row.
+   * insertMeeting(payload) / updateMeeting(id, patch) are injected (DB in production, memory in tests).
+   */
+  async function bookForCustomer({ tenantId, lead, payload, insertMeeting, updateMeeting, now = Date.now() }) {
+    const plan = lead ? await planCustomerBooking(tenantId, lead, now) : { action: "insert" };
+    if (plan.action === "reschedule") {
+      const meeting = await updateMeeting(plan.existing.id, buildReschedulePatch(plan.existing, payload));
+      return {
+        rescheduled: true,
+        existing: plan.existing,
+        meeting: { ...meeting, rescheduled: true, previousScheduledAt: plan.existing.scheduledAt },
+      };
+    }
+    return { rescheduled: false, existing: null, meeting: await insertMeeting(payload) };
+  }
+
+  /**
    * A lead's stage/status was written. If it just LEFT Meeting Booked, settle its scheduled meetings.
    * @returns {{ settled: number, completed: number[], cancelled: number[] }}
    */
@@ -78,9 +112,9 @@ function createMeetingSync(getRepo = defaultRepo) {
     if (!scheduled.length) throw new MeetingRequiredError();
   }
 
-  return { findExistingScheduledForCustomer, planCustomerBooking, settleOnStageChange, guardEnterMeetingBooked };
+  return { findExistingScheduledForCustomer, planCustomerBooking, bookForCustomer, settleOnStageChange, guardEnterMeetingBooked };
 }
 
 const shared = createMeetingSync();
 
-module.exports = { createMeetingSync, MeetingRequiredError, meetingPersonKey, ...shared };
+module.exports = { createMeetingSync, MeetingRequiredError, meetingPersonKey, buildReschedulePatch, ...shared };
