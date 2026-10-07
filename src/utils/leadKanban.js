@@ -3,7 +3,7 @@ const {
   isNotPickupByClientCall,
   isNotPickColumnCall,
   isOutboundCall,
-  isShortConnectedCall,
+  isShortColumnCall,
   phonesMatchLoose,
 } = require("./callMetrics");
 const { mapStageToId, PIPELINE_STAGE_DEFINITIONS } = require("./pipelineStages");
@@ -201,11 +201,10 @@ function isUncontactedNewLead(lead, periodCalls = [], options = {}) {
   return isEmployeeNewAssignedLead(lead);
 }
 
-// Pipeline column rules = the shared call definitions (utils/callMetrics.js):
-//   Conversation = answered, above 2 min (> 120 s), any direction
-//   Short Call   = answered OUTBOUND, 1-120 s (exactly 120 s is Short)
-//   Not Pick     = OUTBOUND call the client did not answer (Rejected is NOT Not Pick)
-// Rejected, Missed (incoming) and Incoming short calls never create a Not Pick / Short Call card.
+// Pipeline column rules = the shared call definitions (utils/callMetrics.js). DIRECTION DOES NOT MATTER:
+//   Conversation = every answered call above 2 min (> 120 s)
+//   Short Call   = every answered call of 1-120 s (exactly 120 s is Short) - outgoing or incoming
+//   Not Pick     = every call that did not connect: not answered / not connected, missed, rejected
 function leadHasConversation2MinPlus(calls = [], { outboundOnly = false } = {}) {
   return calls.some((c) => {
     if (outboundOnly && !isOutboundCall(c)) return false;
@@ -223,7 +222,7 @@ function leadHasNotPickCall(calls = [], { outboundOnly = false } = {}) {
 function leadHasShortCall(calls = [], { outboundOnly = false } = {}) {
   return calls.some((c) => {
     if (outboundOnly && !isOutboundCall(c)) return false;
-    return isShortConnectedCall(c);
+    return isShortColumnCall(c);
   });
 }
 
@@ -235,11 +234,10 @@ function resolveEarlyFunnelColumn(lead, periodCalls = [], options = {}) {
   const allCalls = getCallsForLead(lead, periodCalls, {
     scopeByAssignee: contactOpts.scopeByAssignee,
   });
-  const outboundCalls = getLeadOutboundCalls(lead, periodCalls, contactOpts);
 
   if (leadHasConversation2MinPlus(allCalls, { outboundOnly: false })) return "conversation_2min";
-  if (leadHasShortCall(outboundCalls, { outboundOnly: true })) return "short_call";
-  if (leadHasNotPickCall(outboundCalls, { outboundOnly: true })) return "not_pick";
+  if (leadHasShortCall(allCalls, { outboundOnly: false })) return "short_call";
+  if (leadHasNotPickCall(allCalls, { outboundOnly: false })) return "not_pick";
   if (isUncontactedNewLead(lead, periodCalls, {
     ...contactOpts,
     sinceAssignment: options.sinceAssignment ?? false,
@@ -250,11 +248,12 @@ function resolveEarlyFunnelColumn(lead, periodCalls = [], options = {}) {
 function callKanbanColumn(call) {
   switch (callBucket(call || {})) {
     case "conversation": return "conversation_2min";
-    case "short": return "short_call";
-    case "no_pickup": return "not_pick";
-    // a dial the CUSTOMER rejected (outbound Rejected) -> Not Pick; a rejected INCOMING call (rep declined) moves nothing
-    case "rejected": return isOutboundCall(call || {}) ? "not_pick" : null;
-    default: return null; // missed incoming / incoming short: no stage move
+    case "short":
+    case "incoming_short": return "short_call";   // answered 1-120 s, outgoing or incoming
+    case "no_pickup":
+    case "missed_incoming":
+    case "rejected": return "not_pick";             // did not connect: not answered, missed, rejected
+    default: return null;
   }
 }
 
@@ -542,11 +541,10 @@ function groupKanbanSyncedWithCallyzer(allLeads = [], periodCalls = [], meetings
     const lead = canonicalize(leadIndex.byId.get(leadId));
     if (!lead || !showLead(lead)) continue;
     const leadCalls = getLeadCalls(lead);
-    const outboundCalls = getOutboundCalls(lead);
     let col = null;
     if (leadHasConversation2MinPlus(leadCalls, { outboundOnly: false })) col = "conversation_2min";
-    else if (leadHasShortCall(outboundCalls, { outboundOnly: true })) col = "short_call";
-    else if (leadHasNotPickCall(outboundCalls, { outboundOnly: true })) col = "not_pick";
+    else if (leadHasShortCall(leadCalls, { outboundOnly: false })) col = "short_call";
+    else if (leadHasNotPickCall(leadCalls, { outboundOnly: false })) col = "not_pick";
     if (col && col !== "lead") pushLead(col, lead);
   }
 

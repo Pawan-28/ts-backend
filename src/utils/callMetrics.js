@@ -151,15 +151,28 @@ function isIncomingShortCall(call = {}) {
 /**
  * A dial the CUSTOMER rejected (Rejected outcome on an OUTBOUND call). For the Pipeline COLUMN this counts as
  * "Not Pick" - the customer did not take the call. In the call-category counts it stays its own bucket
- * ("Rejected"), separate from "Not pick". A rejected INCOMING call (the rep declined it) moves nothing.
+ * ("Rejected"), separate from "Not pick" (the Pipeline column rule no longer depends on direction - see isNotPickColumnCall).
  */
 function isCustomerRejectedDial(call = {}) {
   return callBucket(call) === "rejected" && isOutboundCall(call);
 }
 
-/** Pipeline "Not Pick" column rule: outbound not answered, OR outbound rejected by the customer. */
+/**
+ * PIPELINE COLUMN RULES (direction does not matter - incoming and outgoing calls are treated the same):
+ *   Not Pick   = every call that did NOT connect: not answered / not connected, missed, rejected
+ *   Short Call = every ANSWERED call of 1-120 s (outgoing, or incoming = "Incoming short")
+ *   Conversation = every answered call above 120 s
+ * The call COUNTS keep their own categories (Short, Incoming short, Not pick, Missed, Rejected); only the column mapping is shared.
+ */
 function isNotPickColumnCall(call = {}) {
-  return callBucket(call) === "no_pickup" || isCustomerRejectedDial(call);
+  const b = callBucket(call);
+  return b === "no_pickup" || b === "missed_incoming" || b === "rejected";
+}
+
+/** Pipeline "Short Call" column rule: an answered call of 1-120 s, outgoing OR incoming. */
+function isShortColumnCall(call = {}) {
+  const b = callBucket(call);
+  return b === "short" || b === "incoming_short";
 }
 
 function isNotPickupByClientCall(call = {}) {
@@ -359,6 +372,7 @@ module.exports = {
   isNotPickupByClientCall,
   isCustomerRejectedDial,
   isNotPickColumnCall,
+  isShortColumnCall,
   isMissedCall,
   isNotConnectedCall,
   isMissedIncomingCall,

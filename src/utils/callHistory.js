@@ -3,12 +3,11 @@
  * Lead / Not Pick / Short Call / Conversation from what actually happened on the phone, instead of from a
  * stale stored stage or from only the calls of the selected period / current owner.
  *
- *   Conversation = answered, above 2 min (> 120 s, any direction)
- *   Short Call   = answered OUTBOUND, 1-120 s (exactly 120 s is Short)
- *   Not Pick     = OUTBOUND, not answered  OR  an OUTBOUND call the customer REJECTED (rejectedOutbound)
- *                  (in the call-category COUNTS Rejected is still its own bucket, separate from Not pick)
- *   Lead         = none of the above
- *   Missed (incoming), a rejected INCOMING call and Incoming short never move a lead out of Lead on their own.
+ *   Conversation = answered, above 2 min (> 120 s), any direction
+ *   Short Call   = answered, 1-120 s (exactly 120 s is Short), outgoing OR incoming
+ *   Not Pick     = did not connect: not answered / not connected, missed, rejected - any direction
+ *                  (in the call-category COUNTS Missed / Rejected / Not pick / Incoming short stay their own buckets)
+ *   Lead         = no call at all
  *
  * The key is the last 10 digits of the lead's phone (the same key the Pipeline uses for "one card per phone"),
  * or "id:<leadId>" when the lead has no usable phone. Calls from ANY employee and ANY date are included.
@@ -28,8 +27,8 @@ function personKeySql(alias = "l") {
 function historyColumn(h) {
   if (!h) return "lead";
   if (h.conversation > 0) return "conversation_2min";
-  if (h.short > 0) return "short_call";
-  if (h.noPickup > 0 || h.rejectedOutbound > 0) return "not_pick";
+  if (h.short > 0 || h.incomingShort > 0) return "short_call";
+  if (h.noPickup > 0 || h.rejected > 0 || h.missedIncoming > 0) return "not_pick";
   return "lead";
 }
 

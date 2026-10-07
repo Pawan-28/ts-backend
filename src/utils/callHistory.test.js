@@ -22,11 +22,17 @@ test("a dial the CUSTOMER rejected (outbound Rejected) puts the lead in Not Pick
   assert.equal(historyColumn(h({ rejectedOutbound: 2, conversation: 1 })), "conversation_2min");
 });
 
-test("a rejected INCOMING call, Missed (incoming) and Incoming short never leave Lead on their own", () => {
-  assert.equal(historyColumn(h({ rejected: 3, rejectedOutbound: 0 })), "lead"); // rejected, but not an outbound dial
-  assert.equal(historyColumn(h({ missedIncoming: 2 })), "lead");
-  assert.equal(historyColumn(h({ incomingShort: 4 })), "lead");
-  assert.equal(historyColumn(h({ rejected: 3, missedIncoming: 2, incomingShort: 4 })), "lead");
+test("direction does not matter: Incoming short -> Short Call; Missed (incoming) and a rejected INCOMING call -> Not Pick", () => {
+  assert.equal(historyColumn(h({ incomingShort: 1 })), "short_call");
+  assert.equal(historyColumn(h({ incomingShort: 4 })), "short_call");
+  assert.equal(historyColumn(h({ missedIncoming: 2 })), "not_pick");
+  assert.equal(historyColumn(h({ rejected: 3, rejectedOutbound: 0 })), "not_pick"); // rejected, not an outbound dial
+  assert.equal(historyColumn(h({ rejected: 3, missedIncoming: 2 })), "not_pick");
+  // priority is unchanged: Conversation > Short Call > Not Pick > Lead
+  assert.equal(historyColumn(h({ incomingShort: 1, missedIncoming: 9, noPickup: 9 })), "short_call");
+  assert.equal(historyColumn(h({ conversation: 1, incomingShort: 5, missedIncoming: 9 })), "conversation_2min");
+  assert.equal(historyColumn(h({ short: 1, incomingShort: 1 })), "short_call");
+  assert.equal(historyColumn(h()), "lead", "no call at all stays Lead");
 });
 
 test("furthestColumn keeps a stored stage that is further along than the history", () => {

@@ -216,21 +216,23 @@ test("legacy helpers agree with the partition", () => {
   }
 });
 
-test("pipeline columns: Not Pick = unanswered outbound OR an outbound dial the customer rejected; Short = answered outbound 1-120 s; missed / rejected-incoming / incoming short move nothing", () => {
-  assert.equal(callKanbanColumn({ direction: "outbound", outcome: "Not Connected", durationSec: 0 }), "not_pick");
-  // customer rejected our dial -> Not Pick for the column (in the call COUNTS it stays its own "Rejected" bucket)
-  assert.equal(callKanbanColumn({ direction: "outbound", outcome: "Rejected", durationSec: 0 }), "not_pick");
-  assert.equal(callKanbanColumn({ direction: "inbound", outcome: "Rejected", durationSec: 0 }), null); // rep declined an incoming call
-  assert.equal(callKanbanColumn({ direction: "outbound", outcome: "Connected", durationSec: 1 }), "short_call");
-  assert.equal(callKanbanColumn({ direction: "outbound", outcome: "Connected", durationSec: 119 }), "short_call");
-  assert.equal(callKanbanColumn({ direction: "outbound", outcome: "Connected", durationSec: 120 }), "short_call"); // exactly 120 s is Short
-  assert.equal(callKanbanColumn({ direction: "outbound", outcome: "Connected", durationSec: 121 }), "conversation_2min");
-  assert.equal(callKanbanColumn({ direction: "outbound", outcome: "Not Connected", durationSec: 5 }), "not_pick"); // ring-only is not a Short Call
-  assert.equal(callKanbanColumn({ direction: "inbound", outcome: "Missed", durationSec: 0 }), null);
-  assert.equal(callKanbanColumn({ direction: "inbound", outcome: "Connected", durationSec: 45 }), null);
-  assert.equal(callKanbanColumn({ direction: "outbound", outcome: "Connected", durationSec: 45 }), "short_call");
-  assert.equal(callKanbanColumn({ direction: "inbound", outcome: "Connected", durationSec: 200 }), "conversation_2min");
-  assert.equal(callKanbanColumn({ direction: "inbound", outcome: "Not Connected", durationSec: 0 }), "not_pick");
+test("pipeline columns - direction does NOT matter: answered 1-120 s = Short Call, answered > 120 s = Conversation, anything that did not connect = Not Pick", () => {
+  for (const direction of ["outbound", "inbound"]) {
+    assert.equal(callKanbanColumn({ direction, outcome: "Connected", durationSec: 1 }), "short_call", `${direction} 1 s`);
+    assert.equal(callKanbanColumn({ direction, outcome: "Connected", durationSec: 33 }), "short_call", `${direction} 33 s`);
+    assert.equal(callKanbanColumn({ direction, outcome: "Connected", durationSec: 119 }), "short_call", `${direction} 119 s`);
+    assert.equal(callKanbanColumn({ direction, outcome: "Connected", durationSec: 120 }), "short_call", `${direction} exactly 120 s is Short`);
+    assert.equal(callKanbanColumn({ direction, outcome: "Connected", durationSec: 121 }), "conversation_2min", `${direction} 121 s`);
+    assert.equal(callKanbanColumn({ direction, outcome: "Connected", durationSec: 600 }), "conversation_2min", `${direction} 10 min`);
+    // every call that did not connect -> Not Pick (not answered, not connected, missed, rejected)
+    assert.equal(callKanbanColumn({ direction, outcome: "Not Connected", durationSec: 0 }), "not_pick", `${direction} not connected`);
+    assert.equal(callKanbanColumn({ direction, outcome: "Not Connected", durationSec: 5 }), "not_pick", `${direction} ring only is not a Short Call`);
+    assert.equal(callKanbanColumn({ direction, outcome: "Rejected", durationSec: 0 }), "not_pick", `${direction} rejected`);
+    assert.equal(callKanbanColumn({ direction, outcome: "Missed", durationSec: 0 }), "not_pick", `${direction} missed`);
+  }
+  assert.equal(callKanbanColumn({ direction: "inbound", outcome: "Missed", durationSec: 0 }), "not_pick");
+  assert.equal(callKanbanColumn({ direction: "inbound", outcome: "Connected", durationSec: 33 }), "short_call", "the 33 s INBOUND call from the screenshot");
+  assert.equal(callKanbanColumn({ direction: "outbound", outcome: "Not Connected", durationSec: 120 }), "not_pick", "an unanswered outcome never becomes Short just because it has seconds");
 });
 
 test("mapCallStatsRow: SQL row -> API stats keeps the partition and the single pickup definition", () => {
