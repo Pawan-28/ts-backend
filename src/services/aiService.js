@@ -1,6 +1,7 @@
 const pool = require("../../config/db");
 const { logger } = require("../config/logger");
 const { aiSummarySkipReason } = require("../utils/callMetrics");
+const { mergeExtraInfo, extraInfoPromptBlock, EXTRA_INFO_JSON_EXAMPLE } = require("../utils/extraInfo");
 
 // AI Call Summary & MoM now runs on Google Gemini (was OpenAI Whisper + gpt-4o-mini).
 // Key comes from the server environment only (GEMINI_API_KEY) — never sent to the
@@ -508,6 +509,7 @@ async function processCallWithAi(tenantId, callId) {
   let temperature = "Warm Lead";
   let checklistProgress = [];
   let competencyScores = {};
+  let extraInfoRaw = null; // customer-level Extra Info for THIS call (same Gemini call as the MoM - no second pipeline)
 
   const existingTranscript = String(call.transcript || "").trim();
   const hasUsableTranscript = Boolean(existingTranscript);
@@ -614,6 +616,7 @@ Generate:
    - "KYC Questioning": did the rep ask discovery/qualification questions to understand the client's situation
    - "Objection Handling": how well any pushback or hesitation from the client was addressed
    Use 0 for a dimension only if the call gave no signal either way (e.g. call ended immediately).
+${extraInfoPromptBlock()}
 
 Return JSON with exact keys:
 {
@@ -634,7 +637,8 @@ Return JSON with exact keys:
     "Listening Skills": 80,
     "KYC Questioning": 55,
     "Objection Handling": 60
-  }
+  },
+${EXTRA_INFO_JSON_EXAMPLE}
 }`;
         const geminiRes = await geminiGenerateContent(apiKey, {
           systemInstruction: { parts: [{ text: systemPrompt }] },
@@ -680,6 +684,7 @@ Return JSON with exact keys:
               competencyScores = (analysis.competencyScores && typeof analysis.competencyScores === "object")
                 ? analysis.competencyScores
                 : {};
+              extraInfoRaw = analysis.extraInfo && typeof analysis.extraInfo === "object" ? analysis.extraInfo : null;
             }
           }
         } else {
@@ -727,6 +732,21 @@ Return JSON with exact keys:
     );
   }
 
+  // Customer-level Extra Info: fold this call's AI values into the lead's profile (leads.source_meta.extraInfo). A later
+  // "Not discussed" never erases a known value; an explicit new value replaces the old one; an OLD call re-processed later
+  // cannot roll back what a newer call said (utils/extraInfo.js). Never fails the MoM.
+  let extraInfoChanged = [];
+  if (call.lead_id && transcriptSource && extraInfoRaw) {
+    try {
+      extraInfoChanged = await mergeLeadExtraInfo(call.lead_id, extraInfoRaw, {
+        callId,
+        at: call.started_at || call.created_at || new Date(),
+      });
+    } catch (err) {
+      logger.warn("Could not update the customer's Extra Info from this call", { callId, error: err.message });
+    }
+  }
+
   const updatedRes = await pool.query(
     "SELECT * FROM employee_calls WHERE id = $1 LIMIT 1",
     [callId]
@@ -735,7 +755,23 @@ Return JSON with exact keys:
   // qualificationsMet/actionItems) alongside the flattened ai_summary text already on the
   // row, so API consumers get real structure without any schema change — ai_summary
   // itself stays a plain TEXT column, unchanged, fully backward compatible with old rows.
-  return { ...updatedRes.rows[0], structuredSummary };
+  return { ...updatedRes.rows[0], structuredSummary, extraInfoChanged };
+}
+
+/** Merge one call's AI extraInfo into leads.source_meta.extraInfo. Returns the keys that changed. */
+async function mergeLeadExtraInfo(leadId, rawExtraInfo, { callId, at }) {
+  const res = await pool.query("SELECT source_meta FROM leads WHERE id = $1 LIMIT 1", [leadId]);
+  if (!res.rows.length) return [];
+  let meta = res.rows[0].source_meta;
+  if (typeof meta === "string") {
+    try { meta = JSON.parse(meta); } catch { meta = {}; }
+  }
+  meta = meta && typeof meta === "object" && !Array.isArray(meta) ? meta : {};
+  const merged = mergeExtraInfo(meta.extraInfo || null, rawExtraInfo, { callId, at });
+  if (!merged.changed.length) return [];
+  const { changed, ...profile } = merged;
+  await pool.query("UPDATE leads SET source_meta = $1 WHERE id = $2", [JSON.stringify({ ...meta, extraInfo: profile }), leadId]);
+  return changed;
 }
 
 async function ensureAllCallsProcessedWithAi(tenantId = "default") {
@@ -814,4 +850,5 @@ async function ensureAllCallsProcessedWithAi(tenantId = "default") {
 module.exports = {
   processCallWithAi,
   ensureAllCallsProcessedWithAi,
+  mergeLeadExtraInfo, // exported for tests
 };
