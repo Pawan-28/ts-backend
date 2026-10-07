@@ -662,7 +662,7 @@ async function loadEmployeeDashboard(tenantId, employeeId, { syncCallyzer = fals
     repo.listTasks(tenantId, { assigneeId: employeeId, limit: 20 }),
     repo.listFollowups(tenantId, employeeId),
     repo.listCalls(tenantId, employeeId),
-    repo.listMeetings(tenantId, employeeId),
+    repo.listMeetings(tenantId, employeeId, { includeAssignedLeads: true }),
     listAllSops().then((all) => filterSopsForViewer(all, { user: { role: "employee" } })).catch(() => []),
   ]);
   const leads = leadsResult.items;
@@ -1349,7 +1349,7 @@ router.patch("/employee/meetings/:id/mom", validate(momSchema), asyncRoute(async
 }));
 
 router.get("/employee/:employeeId/meetings", requireEmployeeSelf(), asyncRoute(async (req, res) => {
-  const meetings = await repo.listMeetings(tenant(req), req.params.employeeId);
+  const meetings = await repo.listMeetings(tenant(req), req.params.employeeId, { includeAssignedLeads: true });
   return ok(res, meetings);
 }));
 

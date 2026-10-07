@@ -1522,8 +1522,17 @@ async function updateMeeting(tenantId, meetingId, patch) {
   return findMeetingById(tenantId, meetingId);
 }
 
+/**
+ * Meetings for one employee. Default = meetings that employee OWNS (meetings.employee_id) - used by the Pipeline board.
+ * `includeAssignedLeads: true` (the Meetings page) also returns meetings booked by someone else on a lead that is
+ * ASSIGNED to this employee, so every meeting behind a card in their Pipeline is on their Meetings page too
+ * (legacy rows were often booked by another rep / admin, or the lead was reassigned afterwards).
+ */
 async function listMeetings(tenantId, employeeId, options = {}) {
   const limit = Math.min(Math.max(Number(options.limit) || 1000, 1), 2000);
+  const ownerFilter = options.includeAssignedLeads
+    ? "(m.employee_id = $2 OR (l.is_deleted = 0 AND l.assigned_to = $2))"
+    : "m.employee_id = $2";
   const result = await pool.query(
     `SELECT m.*,
             l.lead_name, l.phone AS lead_phone, l.email AS lead_email, l.company_name AS lead_company, l.form_name AS lead_service,
@@ -1531,7 +1540,7 @@ async function listMeetings(tenantId, employeeId, options = {}) {
      FROM meetings m
      LEFT JOIN leads l ON l.id = m.lead_id
      LEFT JOIN employees e ON e.id = m.employee_id
-     WHERE m.tenant_id = $1 AND m.employee_id = $2
+     WHERE m.tenant_id = $1 AND ${ownerFilter}
      ORDER BY m.scheduled_at ASC LIMIT ${limit}`,
     [tenantId, employeeId],
   );
