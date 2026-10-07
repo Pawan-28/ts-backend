@@ -5,11 +5,13 @@ const getIncentiveDashboard = async (req, res) => {
   res.json({
     success: true,
     source: data.source,
+    settingsSource: data.settingsSource,
+    settingsVersion: data.settingsVersion,
     kpis: {
-      totalPayouts: { value: "$62,220", growth: "+14.2%" },
-      avgPerRep: { value: "$15,555", growth: "+8.1%" },
-      topEarner: { name: data.teammates[0]?.name || "Alex", payout: "$22,740" },
-      projectedQ3: { value: "$96k", growth: "+22%" },
+      totalPayouts: { value: "₹62,220", growth: "+14.2%" },
+      avgPerRep: { value: "₹15,555", growth: "+8.1%" },
+      topEarner: { name: data.teammates[0]?.name || "Alex", payout: "₹22,740" },
+      projectedQ3: { value: "₹96K", growth: "+22%" },
     },
     trendData: [
       { month: "Jan", payout: 12000 },
@@ -37,7 +39,7 @@ const getLeaderboard = async (req, res) => {
   const leaderboard = (data.teammates || []).slice(0, 5).map((t, i) => ({
     rank: i + 1,
     name: t.name,
-    payout: `$${((i + 1) * 4200).toLocaleString()}`,
+    payout: `₹${((i + 1) * 4200).toLocaleString("en-IN")}`,
   }));
   res.json({ success: true, leaderboard, payouts: leaderboard.map((l) => ({ id: l.rank, employee: l.name, incentive: l.payout })) });
 };

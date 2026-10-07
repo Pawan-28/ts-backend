@@ -868,6 +868,20 @@ router.get("/pipeline/board", asyncRoute(async (req, res) => {
   const period = String(req.query.period || "month").toLowerCase();
   const limit = Number(req.query.limit) || 5000;
 
+  // period=custom needs startDate/endDate (YYYY-MM-DD) — used by the admin Pipeline's Yesterday / Custom chips.
+  let startDate = null;
+  let endDate = null;
+  if (period === "custom") {
+    startDate = String(req.query.startDate || "");
+    endDate = String(req.query.endDate || "");
+    if (!isValidDateKey(startDate) || !isValidDateKey(endDate)) {
+      return res.status(400).json({ success: false, message: "Custom range needs startDate and endDate as YYYY-MM-DD" });
+    }
+    if (startDate > endDate) {
+      return res.status(400).json({ success: false, message: "From Date must be on or before To Date" });
+    }
+  }
+
   const leadsResult = await repo.listAllLeads(tenantId, {}, { pageSize: 2000, maxPages: 10 });
 
   if (req.query.sync === "1" && callyzer.isConfigured()) {
@@ -892,6 +906,8 @@ router.get("/pipeline/board", asyncRoute(async (req, res) => {
     period,
     limit,
     attachLeads: leadsResult.items,
+    startDate,
+    endDate,
   });
   return ok(res, payload, { syncedAt: new Date().toISOString() });
 }));

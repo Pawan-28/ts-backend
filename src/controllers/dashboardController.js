@@ -32,8 +32,29 @@ const getDashboard = async (req, res) => {
 };
 
 const getRevenue = async (req, res) => {
-  const bundle = await dataService.getDashboardBundle();
-  res.json({ revenue: bundle.revenueSeries, revenueSeries: bundle.revenueSeries });
+  try {
+    // Monthly HISTORY (last 6 months, by lead-created / payment month) - not the selected period.
+    const revenueSeries = await dataService.getRevenueSeries();
+    res.json({ success: true, revenue: revenueSeries, revenueSeries, basis: "monthly-history" });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// AI insights for the SAME period object as the KPI tiles (preset or custom From/To).
+const getDashboardInsights = async (req, res) => {
+  try {
+    const data = await dataService.getDashboardInsightsForPeriod(undefined, {
+      period: req.query.period || req.query.range,
+      startDate: req.query.startDate,
+      endDate: req.query.endDate,
+      employee: req.query.employee,
+      service: req.query.service,
+    });
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 };
 
 const getPipeline = async (req, res) => {
@@ -52,7 +73,7 @@ const getPipeline = async (req, res) => {
 
 const getPipelineStatus = async (req, res) => {
   try {
-    const rangeKey = req.query.range || req.query.period || "week";
+    const rangeKey = req.query.period || req.query.range || "week";
     const service = req.query.service || "All Services";
     const data = await dataService.getPipelineStatusGrid(undefined, {
       rangeKey,
@@ -278,6 +299,7 @@ const getAiCost = async (req, res) => {
 };
 
 module.exports = {
+  getDashboardInsights,
   getAiCost,
   getDashboard,
   getRevenue,

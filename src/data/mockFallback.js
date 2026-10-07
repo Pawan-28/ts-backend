@@ -208,10 +208,11 @@ const DEFAULT_SETTINGS = {
     { id: 2, name: "James Wilson", team: "Enterprise Sales", calls: 390, leads: 39, meetings: 30, revenue: 118000 },
   ],
   kpiWeights: [
-    { id: "revenue", label: "Cash Collected / Revenue", weight: 35, enabled: true },
-    { id: "leads", label: "Converted Leads", weight: 25, enabled: true },
-    { id: "meetings", label: "Completed Meetings", weight: 20, enabled: true },
-    { id: "calls", label: "Call Volume Completed", weight: 20, enabled: true },
+    { id: "calls", label: "Call Conversations", weight: 20, enabled: true },
+    { id: "leads", label: "Qualified Leads", weight: 20, enabled: true },
+    { id: "meetings", label: "Meetings Scheduled", weight: 20, enabled: true },
+    { id: "revenue", label: "Cash Collection", weight: 25, enabled: true },
+    { id: "conversion", label: "Call Conversion (%)", weight: 15, enabled: true },
   ],
   incentiveSlabs: [
     { id: 1, tier: "Bronze", min: 0, max: 100000, rate: 3 },

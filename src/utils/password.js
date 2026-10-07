@@ -31,4 +31,17 @@ function generateTempPassword(length = 10) {
   return out;
 }
 
-module.exports = { hashPassword, verifyPassword, generateTempPassword };
+/**
+ * Password policy for user-chosen passwords: at least 8 characters with a letter and a digit.
+ * Returns an error message, or null when the password is acceptable.
+ */
+function validateNewPassword(plain) {
+  const value = String(plain ?? "");
+  if (value.length < 8) return "New password must be at least 8 characters";
+  if (!/[A-Za-z]/.test(value) || !/\d/.test(value)) {
+    return "New password must include at least one letter and one number";
+  }
+  return null;
+}
+
+module.exports = { hashPassword, verifyPassword, generateTempPassword, validateNewPassword };

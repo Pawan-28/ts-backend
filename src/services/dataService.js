@@ -11,6 +11,8 @@ const {
 const { loadKanbanOppData } = require("./pipelineBoardService");
 const { buildPipelineStatusGridFromKanban, KANBAN_TO_FUNNEL_COL } = require("../utils/leadKanban");
 
+const dashboardMetrics = require("./dashboardMetricsService");
+
 const TENANT = "default";
 
 const CONVERTED_LEAD_SQL = `
@@ -182,55 +184,6 @@ function buildPipelineStatusGrid(rows) {
   };
 }
 
-async function queryPipelineLeadRows(tenantId, rangeKey = "week", service = "All Services", employee = "All Employees", periodOptions = {}) {
-  const params = [tenantId];
-  const whereParts = ["l.tenant_id = $1 AND l.is_deleted = 0"];
-
-  if (service && service !== "All Services") {
-    params.push(`%${service}%`);
-    const idx = params.length;
-    whereParts.push(`(l.form_name LIKE $${idx} OR l.keyword LIKE $${idx} OR l.source LIKE $${idx})`);
-  }
-
-  if (employee && employee !== "All Employees") {
-    params.push(employee);
-    const idx = params.length;
-    whereParts.push(`l.assigned_to = (SELECT id FROM employees WHERE tenant_id = $1 AND name = $${idx} LIMIT 1)`);
-  }
-
-  appendLeadPeriodFilter(whereParts, params, {
-    period: periodOptions.period || rangeKey,
-    rangeKey,
-    startDate: periodOptions.startDate,
-    endDate: periodOptions.endDate,
-    dateMode: periodOptions.dateMode,
-    clipWeekToMonth: periodOptions.clipWeekToMonth,
-  });
-
-  const result = await pool.query(
-    `SELECT l.pipeline_stage, l.status, l.temperature, l.priority, l.form_name
-     FROM leads l
-     WHERE ${whereParts.join(" AND ")}`,
-    params,
-  );
-
-  if (result.rows.length) return result.rows;
-
-  let legacyWhere = "1=1";
-  const legacyParams = [];
-  if (employee && employee !== "All Employees") {
-    legacyParams.push(employee);
-    legacyWhere += ` AND employee_name = $1`;
-  }
-  const legacy = await pool.query(
-    `SELECT pipeline_stage, status, temperature, NULL AS priority, form_name
-     FROM emp_leads
-     WHERE ${legacyWhere}`,
-    legacyParams,
-  );
-  return legacy.rows;
-}
-
 async function getPipelineStatusGrid(tenantId = TENANT, options = {}) {
   const {
     rangeKey = "week",
@@ -274,20 +227,15 @@ async function getPipelineStatusGrid(tenantId = TENANT, options = {}) {
   }
 
   try {
-    // Match Total Leads KPI: all leads created in the period, bucketed by CRM pipeline stage.
-    const rows = await queryPipelineLeadRows(tenantId, rangeKey, service, employee, {
+    // Same lead universe + period object as the KPI tiles (see utils/metricDefinitions.js).
+    return await dashboardMetrics.getPipelineStatus(tenantId, {
       period: period || rangeKey,
+      rangeKey,
       startDate,
       endDate,
-      dateMode: "created",
-      clipWeekToMonth: true,
+      service,
+      employee,
     });
-    const built = buildPipelineStatusGrid(rows);
-    return {
-      success: true,
-      source: rows.length ? "database" : "empty",
-      ...built,
-    };
   } catch (err) {
     console.error("getPipelineStatusGrid error:", err.message);
     return { success: true, source: "mock", ...emptyGrid };
@@ -304,202 +252,12 @@ async function dbReady() {
 }
 
 async function queryLeadsStats(tenantId, periodOptions = null) {
-  const periodOpts = periodOptions || { period: "all" };
-  const leadCountOpts = { ...periodOpts, dateMode: "created", clipWeekToMonth: true };
-  const leadParams = [tenantId];
-  const leadWhere = ["(l.tenant_id = $1 OR l.tenant_id IS NULL) AND l.is_deleted = 0 AND (l.assigned_to IS NULL OR LOWER(COALESCE(e.status, 'active')) = 'active')"];
-  appendLeadPeriodFilter(leadWhere, leadParams, leadCountOpts, "l");
-
-  const callParams = [tenantId];
-  const callWhere = ["tenant_id = $1"];
-  appendColumnPeriodFilter(callWhere, callParams, periodOpts, "COALESCE(started_at, created_at)");
-
-  const cashParams = [tenantId];
-  const cashWhere = ["tenant_id = $1"];
-  appendColumnPeriodFilter(cashWhere, cashParams, periodOpts, "COALESCE(payment_at, created_at)");
-
-  const [result, cashResult, callsResult] = await Promise.all([
-    pool.query(
-      `SELECT
-        COUNT(*) AS total_leads,
-        COALESCE(SUM(l.expected_revenue), 0) AS pipeline_value,
-        SUM(CASE WHEN ${PIPELINE_QUALIFIED_LEAD_SQL} THEN 1 ELSE 0 END) AS qualified,
-        SUM(CASE WHEN ${CONTACTED_LEAD_SQL} THEN 1 ELSE 0 END) AS contacted,
-        SUM(CASE WHEN ${CONVERTED_LEAD_SQL_ALIASED} THEN 1 ELSE 0 END) AS conversions,
-        COALESCE(SUM(CASE WHEN ${CONVERTED_LEAD_SQL_ALIASED} THEN l.expected_revenue ELSE 0 END), 0) AS revenue
-       FROM leads l
-       LEFT JOIN employees e ON e.id = l.assigned_to
-       WHERE ${leadWhere.join(" AND ")}`,
-      leadParams,
-    ),
-    pool.query(
-      `SELECT COALESCE(SUM(amount), 0) AS cash_collected
-       FROM cash_collections
-       WHERE ${cashWhere.join(" AND ")}`,
-      cashParams,
-    ),
-    pool.query(
-      `SELECT
-         COUNT(*) AS total_calls,
-         SUM(CASE WHEN duration_sec > 0 THEN 1 ELSE 0 END) AS connected_calls,
-         SUM(CASE WHEN LOWER(direction) IN ('out', 'outbound', 'outgoing')
-           AND duration_sec >= ${CALL_CONVERSATION_MIN_SEC} THEN 1 ELSE 0 END) AS conversation_calls,
-         COUNT(DISTINCT CASE
-           WHEN lead_id IS NOT NULL
-             AND LOWER(direction) IN ('out', 'outbound', 'outgoing')
-             AND duration_sec >= ${CALL_CONVERSATION_MIN_SEC}
-           THEN lead_id END) AS conversation_leads
-       FROM employee_calls
-       WHERE ${callWhere.join(" AND ")}`,
-      callParams,
-    ),
-  ]);
-
-  const row = result.rows[0] || {};
-  row.cash_collected = cashResult.rows[0]?.cash_collected || 0;
-  row.total_calls = callsResult.rows[0]?.total_calls || 0;
-  row.connected_calls = callsResult.rows[0]?.connected_calls || 0;
-  row.conversation_calls = callsResult.rows[0]?.conversation_calls || 0;
-  row.conversation_leads = callsResult.rows[0]?.conversation_leads || 0;
-  return row;
-}
-
-function formatFilterRangeFromStats(stats, leaderboard = []) {
-  const total = Number(stats.total_leads) || 0;
-  const qualified = Number(stats.qualified) || 0;
-  const contacted = Number(stats.contacted) || 0;
-  const conversationLeads = Number(stats.conversation_leads) || 0;
-  const conversions = Number(stats.conversions) || 0;
-  const revenue = Number(stats.revenue) || 0;
-  const pipeline = Number(stats.pipeline_value) || 0;
-  const cashCollected = Number(stats.cash_collected) || 0;
-  const totalCalls = Number(stats.total_calls) || 0;
-  const connectedCalls = Number(stats.connected_calls) || 0;
-
-  const pickup = totalCalls > 0
-    ? Math.min(100, Math.round((connectedCalls / totalCalls) * 100))
-    : 0;
-
-  const qualNumerator = Math.max(qualified, conversationLeads);
-  let qualification = total > 0
-    ? Math.min(100, Math.round((qualNumerator / total) * 100))
-    : 0;
-  if (qualification === 0 && contacted > 0 && total > 0) {
-    qualification = Math.min(100, Math.round((contacted / total) * 100));
-  }
-
-  const conversion = total > 0 ? Math.min(100, Math.round((conversions / total) * 100)) : 0;
-
-  return {
-    kpis: [
-      { label: "Total Revenue", value: formatINR(revenue), icon: "DollarSign" },
-      { label: "Cash Collected", value: formatINR(cashCollected), icon: "DollarSign" },
-      { label: "Total Leads", value: String(total), icon: "Users" },
-      { label: "Total Calls", value: String(stats.total_calls || 0), icon: "Phone" },
-      { label: "Qualified Leads", value: String(qualified), icon: "FileText" },
-      { label: "Pipeline Value", value: formatINR(pipeline), icon: "DollarSign" },
-      { label: "Closings", value: String(conversions), icon: "Trophy" },
-    ],
-    leaderboard,
-    metrics: {
-      pickup,
-      qualification,
-      conversion,
-    },
-    insights: [],
-    activity: [],
-  };
+  const stats = await dashboardMetrics.queryDashboardStats(tenantId, periodOptions || { period: "all" });
+  return stats;
 }
 
 async function buildFilterRangeForPeriod(tenantId, periodKey, options = {}) {
-  const leadCountOpts = { period: periodKey, ...options, dateMode: "created", clipWeekToMonth: true };
-  const [stats, leaderboard] = await Promise.all([
-    queryLeadsStats(tenantId, leadCountOpts),
-    queryLeaderboard(tenantId, periodKey, 3, leadCountOpts),
-  ]);
-  return formatFilterRangeFromStats(stats, leaderboard);
-}
-
-async function queryLeaderboard(tenantId, rangeKey = "month", limit = 3, options = {}) {
-  const periodOpts = { period: rangeKey, ...options };
-  const leadParams = [tenantId];
-  const leadWhere = ["l.assigned_to = e.id", "l.is_deleted = 0", "l.tenant_id = $1"];
-  appendLeadPeriodFilter(leadWhere, leadParams, { ...periodOpts, dateMode: "created" }, "l");
-
-  const callParams = [tenantId];
-  const callWhere = ["ec.employee_id = e.id", "ec.tenant_id = $1"];
-  appendColumnPeriodFilter(callWhere, callParams, periodOpts, "COALESCE(ec.started_at, ec.created_at)");
-
-  const meetingParams = [tenantId];
-  const meetingWhere = ["m.employee_id = e.id", "m.tenant_id = $1"];
-  appendColumnPeriodFilter(meetingWhere, meetingParams, periodOpts, "COALESCE(m.scheduled_at, m.created_at)");
-
-  const cashParams = [tenantId];
-  const cashWhere = ["cc.employee_id = e.id", "cc.tenant_id = $1"];
-  appendColumnPeriodFilter(cashWhere, cashParams, periodOpts, "COALESCE(cc.payment_at, cc.created_at)");
-
-  const result = await pool.query(
-    `SELECT 
-      e.id, 
-      e.name,
-      COUNT(DISTINCT l.id) AS total_leads,
-      COALESCE((
-        SELECT COUNT(*) FROM employee_calls ec 
-        WHERE ${callWhere.join(" AND ")}
-      ), 0) AS total_calls,
-      COALESCE((
-        SELECT COUNT(*) FROM employee_calls ec 
-        WHERE ${callWhere.join(" AND ")} AND (ec.duration_sec > 0 OR LOWER(COALESCE(ec.outcome, '')) IN ('connected', 'picked_up', 'answered'))
-      ), 0) AS pickup_calls,
-      COALESCE((
-        SELECT COUNT(*) FROM meetings m 
-        WHERE ${meetingWhere.join(" AND ")}
-      ), 0) + SUM(CASE WHEN LOWER(COALESCE(l.pipeline_stage, '')) IN ('meeting booked', 'meeting done', 'booked') OR LOWER(COALESCE(l.status, '')) IN ('meeting booked', 'meeting done', 'booked') THEN 1 ELSE 0 END) AS meetings_booked,
-      SUM(CASE WHEN LOWER(COALESCE(l.pipeline_stage, '')) LIKE '%proposal%' OR LOWER(COALESCE(l.status, '')) LIKE '%proposal%' THEN 1 ELSE 0 END) AS proposals_sent,
-      COALESCE((
-        SELECT SUM(cc.amount) FROM cash_collections cc 
-        WHERE ${cashWhere.join(" AND ")}
-      ), 0) + COALESCE(SUM(CASE WHEN LOWER(COALESCE(l.pipeline_stage, '')) IN ('closed won', 'converted', 'payment complete') OR LOWER(COALESCE(l.status, '')) IN ('closed won', 'converted', 'payment complete', 'advance received', 'paid') THEN COALESCE(l.expected_revenue, 0) ELSE 0 END), 0) AS advance_pay
-     FROM employees e
-     LEFT JOIN leads l ON ${leadWhere.join(" AND ")}
-     WHERE e.tenant_id = $1 AND (LOWER(COALESCE(e.status, 'active')) = 'active')
-     GROUP BY e.id, e.name
-     ORDER BY total_leads DESC, pickup_calls DESC, e.name ASC`,
-    leadParams,
-  );
-
-  let rows = result.rows.slice(0, limit);
-  if (!rows.length) {
-    const emps = await pool.query(
-      `SELECT name, id FROM employees WHERE tenant_id = $1 AND LOWER(COALESCE(status, 'active')) = 'active' ORDER BY name ASC LIMIT $2`,
-      [tenantId, limit],
-    );
-    rows = emps.rows.map((r) => ({ ...r, total_leads: 0, total_calls: 0, pickup_calls: 0, meetings_booked: 0, proposals_sent: 0, advance_pay: 0 }));
-  }
-
-  return rows.map((r) => {
-    const leads = Number(r.total_leads || r.leads) || 0;
-    const totalCalls = Number(r.total_calls) || 0;
-    const pickup = Number(r.pickup_calls) || 0;
-    const meetings = Number(r.meetings_booked) || 0;
-    const proposals = Number(r.proposals_sent) || 0;
-    const advancePay = Number(r.advance_pay) || 0;
-    return {
-      id: r.id,
-      name: r.name,
-      leads,
-      totalCalls,
-      pickup,
-      meetings,
-      proposals,
-      advancePay: formatINR(advancePay),
-      rawAdvancePay: advancePay,
-      convR: leads ? `${Math.round((proposals / leads) * 100)}%` : "0%",
-      qualR: leads ? `${Math.min(99, Math.round(((pickup) / leads) * 100))}%` : "0%",
-      conv: proposals,
-      rev: formatINR(advancePay),
-    };
-  });
+  return dashboardMetrics.buildFilterRange(tenantId, { ...options, period: periodKey });
 }
 
 async function buildFilterDataFromDb(tenantId) {
@@ -526,169 +284,9 @@ async function getFilterRangeForPeriod(tenantId = TENANT, options = {}) {
   }
 }
 
-async function generateRealAiInsights(tenantId = TENANT) {
+async function generateRealAiInsights(tenantId = TENANT, periodInput = { period: "month" }, filters = {}) {
   try {
-    const [leadsRes, empsRes] = await Promise.all([
-      pool.query(
-        `SELECT l.id, 
-          COALESCE(NULLIF(TRIM(l.lead_name), ''), NULLIF(TRIM(l.company_name), ''), CONCAT('Lead #', l.id)) AS lead_name,
-          COALESCE(NULLIF(TRIM(l.company_name), ''), 'Client') AS company_name,
-          l.pipeline_stage, l.status, COALESCE(l.expected_revenue, 0) as revenue,
-          e.name AS assigned_employee
-         FROM leads l
-         INNER JOIN employees e ON e.id = l.assigned_to AND LOWER(COALESCE(e.status, 'active')) = 'active'
-         WHERE (l.tenant_id = $1 OR l.tenant_id IS NULL) 
-           AND l.is_deleted = 0
-           AND LOWER(COALESCE(l.lead_name, '')) NOT IN ('unknown', 'null', '')
-         ORDER BY COALESCE(l.expected_revenue, 0) DESC, l.id DESC LIMIT 10`,
-        [tenantId]
-      ),
-      pool.query(
-        `SELECT e.id, e.name,
-          (SELECT COUNT(*) FROM employee_calls ec WHERE ec.employee_id = e.id) AS total_calls,
-          (SELECT COUNT(*) FROM employee_calls ec WHERE ec.employee_id = e.id AND (ec.duration_sec > 0 OR LOWER(COALESCE(ec.outcome, '')) IN ('connected', 'picked_up', 'answered'))) AS pickup_calls,
-          (SELECT COUNT(*) FROM leads l WHERE l.assigned_to = e.id AND l.is_deleted = 0) AS total_leads
-         FROM employees e
-         WHERE (e.tenant_id = $1 OR e.tenant_id IS NULL) 
-           AND LOWER(COALESCE(e.status, 'active')) = 'active'
-         ORDER BY total_calls DESC LIMIT 5`,
-        [tenantId]
-      ),
-    ]);
-
-    const leads = leadsRes.rows;
-    const emps = empsRes.rows;
-
-    const empNames = emps.map(e => e.name).join(", ");
-    const leadNames = leads.map(l => l.lead_name).slice(0, 6).join(", ");
-
-    const apiKey = process.env.OPENAI_API_KEY;
-
-    if (apiKey) {
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 1500);
-        const response = await fetch("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          signal: controller.signal,
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify({
-            model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-            response_format: { type: "json_object" },
-            messages: [
-              {
-                role: "system",
-                content: `You are the AI Sales Performance Director for TS Publications CRM.
-Analyze the active employee and lead records provided in the payload.
-
-STRICT MANDATORY RULES:
-1. You MUST focus ONLY on the exact active employees provided in the payload: ${empNames || "Sarita, Ritik Verma, Sushmit Verma, Piyush Dhingra"}.
-2. You MUST use ONLY active lead names provided in the payload: ${leadNames || "Narayana Farmers AgriTech, Farlex Pharmaceuticals, Chaitanya Agarwal"}.
-3. CRITICAL: Do NOT mention any inactive or former employees (e.g. Sourav, Rohan, Priya Sharma, Amit Kumar).
-4. Reference exact numbers: call counts, pickups, and revenue figures (₹).
-
-Return a JSON object:
-{
-  "insights": [
-    {
-      "type": "check" or "warn",
-      "category": "Lead Detail" or "Employee Performance",
-      "title": "Short title focusing on active employee or lead",
-      "body": "1-2 sentence detailed summary referencing active names, revenue (₹), and call counts."
-    }
-  ]
-}`
-              },
-              {
-                role: "user",
-                content: `Real Active Database Telemetry:\nActive Employees: ${JSON.stringify(emps)}\nActive Assigned Leads: ${JSON.stringify(leads)}`
-              }
-            ],
-          }),
-        });
-        clearTimeout(timeoutId);
-
-        if (response.ok) {
-          const json = await response.json();
-          const parsed = JSON.parse(json.choices[0].message.content);
-          if (Array.isArray(parsed.insights) && parsed.insights.length) {
-            const filtered = parsed.insights.filter(i => {
-              const text = `${i.title || ""} ${i.body || ""}`.toLowerCase();
-              return !text.includes("sourav") && !text.includes("rohan") && !text.includes("inactive");
-            });
-            if (filtered.length) {
-              return filtered.map(i => ({
-                type: i.type || "check",
-                category: i.category || "AI Insight",
-                title: i.title || "Insight",
-                body: i.body || i.text || "",
-                tone: i.type || "check"
-              }));
-            }
-          }
-        }
-      } catch (err) {
-        console.warn("OpenAI API execution fallback:", err.message);
-      }
-    }
-
-    // High-Precision Telemetry Fallback (Always includes real active lead and employee names & numbers)
-    const insights = [];
-
-    if (emps.length > 0) {
-      const topEmp = emps[0];
-      insights.push({
-        type: "check",
-        category: "Employee Performance",
-        title: `${topEmp.name} - Sales Activity Leader`,
-        body: `${topEmp.name} leads team activity with ${topEmp.total_calls} calls logged and ${topEmp.pickup_calls} connected calls across ${topEmp.total_leads} assigned leads.`,
-        tone: "check",
-      });
-    }
-
-    if (leads.length > 0) {
-      const topLead = leads[0];
-      const leadTitle = topLead.lead_name;
-      const revStr = topLead.revenue > 0 ? ` (₹${Number(topLead.revenue).toLocaleString('en-IN')})` : "";
-      const empStr = topLead.assigned_employee ? ` assigned to ${topLead.assigned_employee}` : "";
-      const stageStr = topLead.pipeline_stage || topLead.status || "Active";
-      insights.push({
-        type: "check",
-        category: "Lead Detail",
-        title: `High-Value Deal: ${leadTitle}`,
-        body: `Lead "${leadTitle}"${revStr}${empStr} is currently in "${stageStr}" stage. Prioritize high-touch follow-up.`,
-        tone: "check",
-      });
-    }
-
-    if (emps.length > 1) {
-      const secEmp = emps[1];
-      insights.push({
-        type: "check",
-        category: "Employee Performance",
-        title: `${secEmp.name} - High Call Volume`,
-        body: `${secEmp.name} achieved ${secEmp.total_calls} calls with ${secEmp.pickup_calls} connected calls, driving active pipeline progression.`,
-        tone: "check",
-      });
-    }
-
-    if (leads.length > 1) {
-      const secLead = leads[1];
-      const leadTitle = secLead.lead_name;
-      const empStr = secLead.assigned_employee ? ` assigned to ${secLead.assigned_employee}` : "";
-      const stageStr = secLead.pipeline_stage || secLead.status || "New Lead";
-      insights.push({
-        type: "warn",
-        category: "Lead Detail",
-        title: `Action Required: ${leadTitle}`,
-        body: `Lead "${leadTitle}"${empStr} is in "${stageStr}" stage. Schedule an immediate outreach call.`,
-        tone: "warn",
-      });
-    }
-
+    const { insights } = await dashboardMetrics.getDashboardInsights(tenantId, periodInput, filters);
     return insights;
   } catch (err) {
     console.error("generateRealAiInsights error:", err.message);
@@ -721,13 +319,13 @@ async function getActivityFromDb(limit = 10) {
 function emptyFilterRange() {
   return {
     kpis: [
-      { label: "Total Revenue", value: "₹0", icon: "DollarSign" },
+      { label: "Revenue", value: "₹0", icon: "DollarSign" },
       { label: "Cash Collected", value: "₹0", icon: "DollarSign" },
       { label: "Total Leads", value: "0", icon: "Users" },
       { label: "Total Calls", value: "0", icon: "Phone" },
       { label: "Qualified Leads", value: "0", icon: "FileText" },
       { label: "Pipeline Value", value: "₹0", icon: "DollarSign" },
-      { label: "Closings", value: "0", icon: "Trophy" },
+      { label: "Closed Deals", value: "0", icon: "Trophy" },
     ],
     leaderboard: [],
     metrics: { pickup: 0, qualification: 0, conversion: 0 },
@@ -742,6 +340,31 @@ function emptyFilterData() {
     week: emptyFilterRange(),
     month: emptyFilterRange(),
   };
+}
+
+/** Period-aware AI insights for the Dashboard card (period object = same as KPI tiles). */
+async function getDashboardInsightsForPeriod(tenantId = TENANT, options = {}) {
+  if (!(await dbReady())) return { success: true, source: "empty", insights: [] };
+  try {
+    const { period, insights } = await dashboardMetrics.getDashboardInsights(tenantId, options, {
+      employee: options.employee,
+      service: options.service,
+    });
+    return { success: true, source: "database", period, insights };
+  } catch (err) {
+    console.error("getDashboardInsightsForPeriod error:", err.message);
+    return { success: true, source: "error", insights: [] };
+  }
+}
+
+async function getRevenueSeries(tenantId = TENANT) {
+  if (!(await dbReady())) return [];
+  try {
+    return await dashboardMetrics.queryRevenueSeries(tenantId);
+  } catch (err) {
+    console.error("getRevenueSeries error:", err.message);
+    return [];
+  }
 }
 
 let dashboardBundleCache = {};
@@ -770,37 +393,7 @@ async function getDashboardBundle(tenantId = TENANT) {
       buildFilterDataFromDb(tenantId),
       generateRealAiInsights(tenantId),
       getActivityFromDb(8),
-      pool.query(
-        `SELECT 
-          DATE_FORMAT(c.m_date, '%b') AS month,
-          COALESCE(SUM(c.rev), 0) AS revenue,
-          COALESCE(SUM(c.cash), 0) AS cash_collected,
-          COALESCE(SUM(c.closed_count), 0) AS closed_count
-         FROM (
-           SELECT l.created_at AS m_date, 
-             CASE WHEN ${CONVERTED_LEAD_SQL_ALIASED.replace(/\n/g, " ")} THEN l.expected_revenue ELSE 0 END AS rev,
-             0 AS cash,
-             CASE WHEN ${CONVERTED_LEAD_SQL_ALIASED.replace(/\n/g, " ")} THEN 1 ELSE 0 END AS closed_count
-           FROM leads l
-           LEFT JOIN employees e ON e.id = l.assigned_to
-           WHERE (l.tenant_id = $1 OR l.tenant_id IS NULL) 
-             AND l.is_deleted = 0 
-             AND (l.assigned_to IS NULL OR LOWER(COALESCE(e.status, 'active')) = 'active')
-             AND l.created_at >= DATE_SUB(NOW(), INTERVAL 6 MONTH)
-           UNION ALL
-           SELECT cc.payment_at AS m_date,
-             0 AS rev,
-             cc.amount AS cash,
-             0 AS closed_count
-           FROM cash_collections cc
-           INNER JOIN employees e ON e.id = cc.employee_id AND LOWER(COALESCE(e.status, 'active')) = 'active'
-           WHERE (cc.tenant_id = $1 OR cc.tenant_id IS NULL) 
-             AND cc.payment_at >= DATE_SUB(NOW(), INTERVAL 6 MONTH)
-         ) c
-         GROUP BY DATE_FORMAT(c.m_date, '%Y-%m'), DATE_FORMAT(c.m_date, '%b')
-         ORDER BY DATE_FORMAT(c.m_date, '%Y-%m')`,
-        [tenantId],
-      )
+      dashboardMetrics.queryRevenueSeries(tenantId),
     ]);
 
     const aiInsights = liveAiInsights.length
@@ -819,14 +412,7 @@ async function getDashboardBundle(tenantId = TENANT) {
       }
     }
 
-    const revenueSeries = revenueResult.rows.map((r) => ({
-      month: r.month,
-      revenue: Math.round(Number(r.revenue) / 100000 * 10) / 10 || 0,
-      cashCollected: Math.round(Number(r.cash_collected) / 100000 * 10) / 10 || 0,
-      closedCount: Number(r.closed_count) || 0,
-      rawRevenue: Number(r.revenue) || 0,
-      rawCash: Number(r.cash_collected) || 0,
-    }));
+    const revenueSeries = revenueResult;
 
     const result = { source: "database", filterData, revenueSeries, aiInsights, success: true };
     dashboardBundleCache[cacheKey] = { timestamp: Date.now(), data: result };
@@ -1324,11 +910,22 @@ async function listServices(tenantId = TENANT) {
       : mock.SERVICES.filter((r) => !deletedNamesSet.has((r.name || "").toLowerCase()) && !deletedNamesSet.has((r.id || "").toLowerCase()));
 
     // 3) Calculate actual lead metrics for each service
+    // `revenue` / `pipelineValue` = sum of expected_revenue across the service's leads (pipeline value, NOT realised
+    // revenue). `wonRevenue` / `converted` only count closed-won leads (converted / won / payment complete).
     const allLeadsResult = await pool.query(
-      `SELECT requirements, source_meta, status, expected_revenue FROM leads WHERE (tenant_id = $1 OR tenant_id IS NULL) AND is_deleted = 0`,
+      `SELECT requirements, source_meta, status, pipeline_stage, expected_revenue, created_at FROM leads WHERE (tenant_id = $1 OR tenant_id IS NULL) AND is_deleted = 0`,
       [tenantId],
     );
     const allLeads = allLeadsResult.rows || [];
+    const isWonLead = (l) => {
+      const st = String(l.status || "").toLowerCase();
+      const stage = String(l.pipeline_stage || "").toLowerCase();
+      return (
+        st.includes("converted") || st.includes("payment complete") || st === "won" || st.includes("closed won")
+        || stage.includes("payment complete") || stage === "converted" || stage.includes("won")
+      );
+    };
+    const matchedLeadIdx = new Set();
 
     const services = baseServices.map((r) => {
       const metaObj = (typeof r.metadata === "string" ? JSON.parse(r.metadata) : r.metadata) || {};
@@ -1336,23 +933,29 @@ async function listServices(tenantId = TENANT) {
       const sCode = r.service_code || metaObj.serviceCode || metaObj.serviceId || r.id;
       
       // Filter leads belonging to this service
-      const matchingLeads = allLeads.filter((l) => {
+      const matchingLeads = [];
+      allLeads.forEach((l, idx) => {
+        let hit = false;
         const reqSvc = cleanServiceName(l.requirements);
-        if (reqSvc && reqSvc.toLowerCase() === String(svcName).toLowerCase()) return true;
-        if (l.source_meta) {
+        if (reqSvc && reqSvc.toLowerCase() === String(svcName).toLowerCase()) hit = true;
+        if (!hit && l.source_meta) {
           const m = typeof l.source_meta === "string" ? JSON.parse(l.source_meta) : l.source_meta;
-          if (m?.service && cleanServiceName(m.service).toLowerCase() === String(svcName).toLowerCase()) return true;
+          if (m?.service && cleanServiceName(m.service).toLowerCase() === String(svcName).toLowerCase()) hit = true;
         }
-        return String(l.requirements || "").toLowerCase().includes(String(svcName).toLowerCase());
+        if (!hit && String(l.requirements || "").toLowerCase().includes(String(svcName).toLowerCase())) hit = true;
+        if (hit) {
+          matchingLeads.push(l);
+          matchedLeadIdx.add(idx);
+        }
       });
 
       const leadsCount = matchingLeads.length > 0 ? matchingLeads.length : Number(r.leads) || 0;
-      const convertedCount = matchingLeads.length > 0 
-        ? matchingLeads.filter(l => String(l.status || "").toLowerCase().includes("converted") || String(l.status || "").toLowerCase().includes("payment")).length 
-        : Number(r.converted) || 0;
+      const wonLeads = matchingLeads.filter(isWonLead);
+      const convertedCount = matchingLeads.length > 0 ? wonLeads.length : Number(r.converted) || 0;
       const revenueSum = matchingLeads.length > 0
         ? matchingLeads.reduce((acc, l) => acc + (Number(l.expected_revenue) || 0), 0)
         : Number(r.revenue) || 0;
+      const wonRevenue = wonLeads.reduce((acc, l) => acc + (Number(l.expected_revenue) || 0), 0);
       const convRate = leadsCount > 0 ? Math.round((convertedCount / leadsCount) * 100) : Number(r.conv_rate) || 0;
 
       return {
@@ -1365,6 +968,8 @@ async function listServices(tenantId = TENANT) {
         categoryLabel: r.category_label || "General Services",
         status: r.status || "ACTIVE",
         revenue: revenueSum,
+        pipelineValue: revenueSum,
+        wonRevenue,
         leads: leadsCount,
         converted: convertedCount,
         convRate: convRate,
@@ -1374,11 +979,30 @@ async function listServices(tenantId = TENANT) {
         distributionEmployeeIds: Array.isArray(metaObj.distributionEmployeeIds) ? metaObj.distributionEmployeeIds : [],
         distributionEmployeeNames: Array.isArray(metaObj.distributionEmployeeNames) ? metaObj.distributionEmployeeNames : [],
         description: r.description || `Service catalog offering for ${svcName}`,
+        createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
         icon: r.icon || "briefcase",
       };
     });
 
-    return { source: "database", services, success: true };
+    // 4) Real month-by-month series: expected revenue (pipeline value) of leads created each month that belong to a
+    // catalog service. Each lead is counted once even if it matches several services.
+    const monthMap = new Map();
+    matchedLeadIdx.forEach((idx) => {
+      const l = allLeads[idx];
+      if (!l.created_at) return;
+      const d = new Date(l.created_at);
+      if (Number.isNaN(d.getTime())) return;
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+      const row = monthMap.get(key) || { month: key, leads: 0, pipelineValue: 0, won: 0, wonRevenue: 0 };
+      const rev = Number(l.expected_revenue) || 0;
+      row.leads += 1;
+      row.pipelineValue += rev;
+      if (isWonLead(l)) { row.won += 1; row.wonRevenue += rev; }
+      monthMap.set(key, row);
+    });
+    const revenueByMonth = Array.from(monthMap.values()).sort((a, b) => a.month.localeCompare(b.month));
+
+    return { source: "database", services, revenueByMonth, success: true };
   } catch (err) {
     console.error("[dataService] listServices error:", err);
     return { source: "empty", services: [], success: true };
@@ -1678,7 +1302,7 @@ async function getIncentivesData(tenantId = TENANT, month) {
                  THEN 1 ELSE 0 END) AS converted_leads
            FROM leads
            WHERE tenant_id = $1 AND is_deleted = 0
-             AND DATE_FORMAT(created_at, '%Y-%m') = $2
+             AND DATE_FORMAT(COALESCE(updated_at, created_at), '%Y-%m') = $2
            GROUP BY assigned_to`,
           [tenantId, targetMonth]
         ),
@@ -1716,7 +1340,21 @@ async function getIncentivesData(tenantId = TENANT, month) {
       const cashMap = {};
       cashRes.rows.forEach(r => { cashMap[r.employee_id] = Number(r.total_cash) || 0; });
 
+      // Targets: the employee's own record (also edited from Team / published from Settings) wins,
+      // then the saved Settings per-employee target, then the page default.
+      const savedTargets = Array.isArray(settings.employeeTargets) ? settings.employeeTargets : [];
+      const pickTarget = (own, saved, fallback) => {
+        if (Number(own) > 0) return Number(own);
+        if (Number(saved) > 0) return Number(saved);
+        return fallback;
+      };
+
       teammates = empRes.rows.map((e) => {
+        const savedRow = savedTargets.find((r) => Number(r.id) === Number(e.id)) || {};
+        const targetCalls = pickTarget(e.call_target, savedRow.calls, 50);
+        const targetQualified = pickTarget(e.qualified_lead_target, savedRow.leads, 20);
+        const targetMeetings = pickTarget(e.meeting_target, savedRow.meetings, 15);
+        const targetCash = pickTarget(e.cash_target, savedRow.revenue, 100000);
         const empCalls = callsMap[e.id] || { total: 0, connected: 0, conversations5Min: 0 };
         const empLeads = leadsMap[e.id] || { total: 0, qualified: 0, booked: 0, converted: 0 };
 
@@ -1733,13 +1371,13 @@ async function getIncentivesData(tenantId = TENANT, month) {
           department: e.department || "Sales & Growth",
           salary: e.salary || 0,
           callsCompleted: empCalls.conversations5Min,
-          callsTarget: e.call_target || 50,
+          callsTarget: targetCalls,
           qualifiedLeads: empLeads.qualified,
-          qualifiedTarget: e.qualified_lead_target || 20,
+          qualifiedTarget: targetQualified,
           meetingsScheduled: empLeads.booked || meetingsMap[e.id] || 0,
-          meetingsTarget: e.meeting_target || 15,
+          meetingsTarget: targetMeetings,
           cashCollected: cashMap[e.id] || 0,
-          cashTarget: e.cash_target || 100000,
+          cashTarget: targetCash,
           responseTimeMin: 1.8,
           pickupRate,
           qualificationRate,
@@ -1747,10 +1385,10 @@ async function getIncentivesData(tenantId = TENANT, month) {
           conversionRate,
           followUpQuality,
           targets: {
-            calls: e.call_target || 50,
-            qualifiedLeads: e.qualified_lead_target || 20,
-            meetings: e.meeting_target || 15,
-            cash: e.cash_target || 100000,
+            calls: targetCalls,
+            qualifiedLeads: targetQualified,
+            meetings: targetMeetings,
+            cash: targetCash,
           },
           weightages: {
             calls: e.call_weightage || 0,
@@ -1768,6 +1406,10 @@ async function getIncentivesData(tenantId = TENANT, month) {
   return {
     success: true,
     source: teammates.length ? "database" : "mock",
+    settingsSource: Array.isArray(settings.kpiWeights) && settings.kpiWeights.length && settingsRes.source === "database"
+      ? "settings"
+      : "default",
+    settingsVersion: settings.currentVersion || null,
     incentiveSlabs: settings.incentiveSlabs || mock.DEFAULT_SETTINGS.incentiveSlabs,
     kpiWeights: settings.kpiWeights || mock.DEFAULT_SETTINGS.kpiWeights,
     baseIncentiveRate: settings.baseIncentiveRate ?? 2.5,
@@ -2001,176 +1643,17 @@ async function getOppCategoryLeads(tenantId = TENANT, options = {}) {
 }
 
 async function getSalesAiInsights(tenantId = TENANT, options = {}) {
-  const { employee, service } = options;
-  const isSpecificEmp = employee && employee !== "All Employees";
-
+  const emptyFunnel = {
+    label: "Open pipeline value", value: "₹0", growth: "0%", comparison: "0 open leads", pct: "0%", matchText: "0 of 0 closed", inputs: "",
+  };
   if (!(await dbReady())) {
-    return {
-      success: true,
-      cards: [],
-      funnelData: { value: "₹0", growth: "0%", comparison: "0% vs Target", pct: "0%", matchText: "0% target match" }
-    };
+    return { success: true, cards: [], funnelData: emptyFunnel };
   }
-
   try {
-    let leadsWhere = ["(l.tenant_id = $1 OR l.tenant_id IS NULL)", "l.is_deleted = 0", "LOWER(COALESCE(e.status, 'active')) = 'active'"];
-    let leadsParams = [tenantId];
-
-    if (isSpecificEmp) {
-      leadsParams.push(employee);
-      leadsWhere.push(`e.name = $${leadsParams.length}`);
-    }
-    if (service && service !== "All Services") {
-      leadsParams.push(`%${service}%`);
-      const si = leadsParams.length;
-      leadsWhere.push(`(l.requirements LIKE $${si} OR l.source_meta LIKE $${si})`);
-    }
-
-    const leadsQuery = `
-      SELECT l.id, 
-        COALESCE(NULLIF(TRIM(l.lead_name), ''), NULLIF(TRIM(l.company_name), ''), CONCAT('Lead #', l.id)) AS lead_name,
-        COALESCE(NULLIF(TRIM(l.company_name), ''), 'Client') AS company_name,
-        l.pipeline_stage, l.status, COALESCE(l.expected_revenue, 0) as revenue,
-        e.name AS assigned_employee
-      FROM leads l
-      INNER JOIN employees e ON e.id = l.assigned_to
-      WHERE ${leadsWhere.join(" AND ")}
-      ORDER BY COALESCE(l.expected_revenue, 0) DESC, l.id DESC LIMIT 15
-    `;
-
-    const leadsRes = await pool.query(leadsQuery, leadsParams);
-    const leads = leadsRes.rows || [];
-
-    // Calculate real Predictive Win Funnel telemetry
-    const totalRev = leads.reduce((acc, l) => acc + Number(l.revenue || 0), 0);
-    const convertedLeads = leads.filter(l => {
-      const st = String(l.pipeline_stage || l.status || "").toLowerCase();
-      return st.includes("converted") || st.includes("won") || st.includes("closed") || st.includes("showed");
-    });
-    const convPct = leads.length > 0 ? Math.round((convertedLeads.length / leads.length) * 100) : 0;
-
-    const funnelData = {
-      value: formatINR(totalRev),
-      growth: `${convPct}%`,
-      comparison: `${convPct}% vs Target`,
-      pct: `${Math.min(100, convPct || (totalRev > 0 ? 65 : 0))}%`,
-      matchText: `${convPct || (totalRev > 0 ? 65 : 0)}% target match`
-    };
-
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (apiKey && leads.length > 0) {
-      try {
-        const response = await fetch("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify({
-            model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-            response_format: { type: "json_object" },
-            messages: [
-              {
-                role: "system",
-                content: `You are the AI Sales Performance Director for TS Publications.
-Generate 3 realistic deal action insight cards based strictly on the active lead database payload provided.
-Target scope: ${isSpecificEmp ? `Employee: ${employee}` : "All Active Sales Reps"}.
-
-STRICT MANDATORY RULES:
-1. ONLY reference lead names and employee names present in the payload. Do NOT use fake names like 'Nimbus Labs' or 'Pylon Corp'.
-2. If payload has leads, pick top 3 real leads and construct:
-   - Card 1 (High Win Probability): badge e.g. "92% WIN PROB", tone "purple", title: real lead name, desc: concise 1-sentence prediction with assigned rep name and revenue ₹, actionText: "Notify Rep", actionToast: "Rep notified"
-   - Card 2 (Risk Assessment): badge e.g. "HIGH RISK", tone "warn", title: real lead name, desc: concise 1-sentence stalled pipeline alert with revenue ₹, actionText: "Send Reminder", actionToast: "Reminder sent"
-   - Card 3 (Hot Lead / Action): badge e.g. "98% HOT", tone "success", title: real lead name, desc: concise 1-sentence touchpoint action, actionText: "Contact Lead", actionToast: "Initiating contact"
-3. Do NOT mention any deleted/inactive employees (Sourav, Rohan, Priya Sharma).
-
-Return JSON format:
-{
-  "cards": [
-    { "title": "Lead Name", "badge": "92% WIN PROB", "tone": "purple"|"warn"|"success"|"info", "desc": "Text", "actionText": "Btn Text", "actionToast": "Toast Text" }
-  ]
-}`
-              },
-              {
-                role: "user",
-                content: `Telemetry Payload:\nLeads: ${JSON.stringify(leads.slice(0, 8))}`
-              }
-            ],
-          }),
-        });
-
-        if (response.ok) {
-          const json = await response.json();
-          const parsed = JSON.parse(json.choices[0].message.content);
-          if (Array.isArray(parsed.cards) && parsed.cards.length > 0) {
-            const filteredCards = parsed.cards.filter(c => {
-              const text = `${c.title || ""} ${c.desc || ""}`.toLowerCase();
-              return !text.includes("sourav") && !text.includes("rohan") && !text.includes("nimbus");
-            });
-            if (filteredCards.length > 0) {
-              return {
-                success: true,
-                cards: filteredCards,
-                funnelData
-              };
-            }
-          }
-        }
-      } catch (err) {
-        console.warn("OpenAI Sales AI Insights error:", err.message);
-      }
-    }
-
-    // Telemetry fallback built dynamically from real SQL rows
-    const cards = [];
-    if (leads.length > 0) {
-      const l1 = leads[0];
-      cards.push({
-        title: l1.lead_name,
-        badge: "HIGH WIN PROB",
-        tone: "purple",
-        desc: `Proposal & negotiation active for ${l1.company_name || l1.lead_name} (${formatINR(l1.revenue)}). Assigned to ${l1.assigned_employee}.`,
-        actionText: "Notify Rep",
-        actionToast: `Notified ${l1.assigned_employee} for deal follow-up`
-      });
-
-      if (leads.length > 1) {
-        const l2 = leads[1];
-        cards.push({
-          title: l2.lead_name,
-          badge: "HIGH RISK",
-          tone: "warn",
-          desc: `Stalled in ${l2.pipeline_stage || "pipeline"} stage. High lead value (${formatINR(l2.revenue)}) requires rep intervention.`,
-          actionText: "Send Reminder",
-          actionToast: `Follow-up reminder sent to ${l2.assigned_employee}`
-        });
-      }
-
-      if (leads.length > 2) {
-        const l3 = leads[2];
-        cards.push({
-          title: l3.lead_name,
-          badge: "98% HOT",
-          tone: "success",
-          desc: `High engagement recorded for ${l3.lead_name} in ${l3.pipeline_stage || "new lead"} stage. Assigned to ${l3.assigned_employee}.`,
-          actionText: "Contact Lead",
-          actionToast: `Contacting ${l3.lead_name}...`
-        });
-      }
-    }
-
-    return {
-      success: true,
-      cards,
-      funnelData
-    };
+    return await dashboardMetrics.getSalesInsights(tenantId, options);
   } catch (err) {
     console.error("getSalesAiInsights error:", err);
-    return {
-      success: false,
-      cards: [],
-      funnelData: { value: "₹0", growth: "0%", comparison: "0% vs Target", pct: "0%", matchText: "0% target match" }
-    };
+    return { success: false, cards: [], funnelData: emptyFunnel };
   }
 }
 
@@ -2179,6 +1662,8 @@ module.exports = {
   formatINR,
   dbReady,
   getDashboardBundle,
+  getDashboardInsightsForPeriod,
+  getRevenueSeries,
   getFilterRangeForPeriod,
   getPipelineLeads,
   listLeadTasks,

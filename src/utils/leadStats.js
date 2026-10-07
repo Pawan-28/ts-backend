@@ -236,4 +236,5 @@ module.exports = {
   isMeeting,
   isConverted,
   isActiveLead,
+  mapLeadKanbanStage,
 };

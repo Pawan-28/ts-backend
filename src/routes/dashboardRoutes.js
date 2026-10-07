@@ -3,6 +3,7 @@ const express = require("express");
 const router = express.Router();
 
 const {
+  getDashboardInsights,
   getAiCost,
   getDashboard,
   getRevenue,
@@ -25,6 +26,9 @@ router.get("/", getDashboard);
 
 // AI (Gemini) transcript + MoM cost
 router.get("/ai-cost", getAiCost);
+
+// AI insights (period-aware)
+router.get("/insights", getDashboardInsights);
 
 // REVENUE CHART
 router.get("/revenue", getRevenue);

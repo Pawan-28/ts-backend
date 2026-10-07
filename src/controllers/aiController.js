@@ -2,6 +2,17 @@ const dataService = require("../services/dataService");
 
 const getInsights = async (req, res) => {
   const context = req.query.context || "dashboard";
+  // Period-aware path: same period object (preset or custom From/To) as the Dashboard KPI tiles.
+  if (req.query.period || req.query.range) {
+    const data = await dataService.getDashboardInsightsForPeriod(undefined, {
+      period: req.query.period || req.query.range,
+      startDate: req.query.startDate,
+      endDate: req.query.endDate,
+      employee: req.query.employee,
+      service: req.query.service,
+    });
+    return res.json(data);
+  }
   const dbInsights = await dataService.getAiInsightsFromDb(dataService.TENANT, context);
   if (dbInsights.length) {
     res.json({ success: true, source: "database", insights: dbInsights });

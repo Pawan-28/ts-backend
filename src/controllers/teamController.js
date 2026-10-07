@@ -4,6 +4,7 @@ const {
   buildPeriodDateFilter,
   buildCustomDateFilter,
   buildPreviousPeriodDateFilter,
+  isValidDateKey,
   rangeQueryToPeriod,
   comparisonLabelForPeriod,
 } = require("../utils/periodFilter");
@@ -164,13 +165,42 @@ const getTeamPerformance = (req, res) => {
   });
 };
 
+/**
+ * Optional period scope for the per-member lead metrics (leads / conv / contacted /
+ * revenue / active_leads). Cohort = leads assigned to the member in the period
+ * (COALESCE(assigned_at, created_at), same basis as /kpis), so conversion and revenue
+ * are always computed from the same lead set. No `range` => all-time (other pages rely on it).
+ */
+function buildEmployeeLeadPeriodFilter(query = {}) {
+  const { range, startDate, endDate } = query;
+  if (!range) return { clause: "", params: [], meta: null };
+  const period = rangeQueryToPeriod(range);
+  const column = "COALESCE(l.assigned_at, l.created_at)";
+  const filter = period === "custom"
+    ? (isValidDateKey(startDate) && isValidDateKey(endDate)
+      ? buildCustomDateFilter({ startDate, endDate, column, paramOffset: 1 })
+      : null)
+    : buildPeriodDateFilter({ period, column, paramOffset: 1 });
+  if (!filter) return { error: "Custom range needs valid startDate and endDate (YYYY-MM-DD)" };
+  return {
+    clause: ` AND ${filter.clause}`,
+    params: filter.params,
+    meta: { period: filter.period, periodLabel: filter.label },
+  };
+}
+
 const getEmployees = async (req, res) => {
   try {
+    const periodFilter = buildEmployeeLeadPeriodFilter(req.query);
+    if (periodFilter.error) {
+      return res.status(400).json({ success: false, message: periodFilter.error });
+    }
+    const lf = periodFilter.clause;
     const result = await pool.query(
       `SELECT e.*,
         m.name AS manager_name,
-        (SELECT COUNT(*) FROM leads l WHERE l.assigned_to = e.id AND l.is_deleted = 0) AS leads,
-        (SELECT COUNT(*) FROM leads l WHERE l.assigned_to = e.id AND l.is_deleted = 0) AS total_leads,
+        (SELECT COUNT(*) FROM leads l WHERE l.assigned_to = e.id AND l.is_deleted = 0${lf}) AS leads,
+        (SELECT COUNT(*) FROM leads l WHERE l.assigned_to = e.id AND l.is_deleted = 0${lf}) AS total_leads,
         COALESCE((
           SELECT COUNT(*) FROM employee_calls ec WHERE ec.employee_id = e.id
         ), 0) AS total_calls,
@@ -198,31 +228,33 @@ const getEmployees = async (req, res) => {
           AND (LOWER(COALESCE(l.pipeline_stage, '')) IN ('converted', 'won', 'closed won', 'payment complete') OR LOWER(COALESCE(l.status, '')) IN ('converted', 'won', 'payment complete', 'advance received', 'paid'))
         ), 0) AS cash_collected,
         (SELECT COUNT(*) FROM leads l
-          WHERE l.assigned_to = e.id AND l.is_deleted = 0
+          WHERE l.assigned_to = e.id AND l.is_deleted = 0${lf}
             AND (
               LOWER(COALESCE(l.pipeline_stage, '')) IN ('converted', 'won', 'closed won')
               OR LOWER(COALESCE(l.status, '')) IN ('converted', 'won')
             )) AS conv,
         (SELECT COUNT(*) FROM leads l
-          WHERE l.assigned_to = e.id AND l.is_deleted = 0
+          WHERE l.assigned_to = e.id AND l.is_deleted = 0${lf}
             AND ${CONTACTED_LEAD_SQL.replace(/\n\s*/g, " ")}) AS contacted,
         (SELECT COALESCE(SUM(l.expected_revenue), 0) FROM leads l
-          WHERE l.assigned_to = e.id AND l.is_deleted = 0
+          WHERE l.assigned_to = e.id AND l.is_deleted = 0${lf}
             AND (
               LOWER(COALESCE(l.pipeline_stage, '')) IN ('converted', 'won', 'closed won')
               OR LOWER(COALESCE(l.status, '')) IN ('converted', 'won')
             )) AS revenue,
         (SELECT COUNT(*) FROM leads l
-          WHERE l.assigned_to = e.id AND l.is_deleted = 0
+          WHERE l.assigned_to = e.id AND l.is_deleted = 0${lf}
             AND ${ACTIVE_LEAD_SQL.replace(/\n\s*/g, " ")}) AS active_leads
        FROM employees e
        LEFT JOIN employees m ON m.id = e.manager_id
        WHERE LOWER(COALESCE(e.status, 'active')) <> 'inactive'
        ORDER BY e.name ASC`,
+      periodFilter.params,
     );
     res.json({
       success: true,
       employees: result.rows,
+      ...(periodFilter.meta || {}),
     });
   } catch (error) {
     console.error("Error fetching employees:", error);
@@ -383,7 +415,8 @@ const getEmployeeDetails = async (req, res) => {
       `SELECT
          COUNT(*) AS total_calls,
          SUM(CASE WHEN duration_sec >= ${CALL_CONVERSATION_MIN_SEC} THEN 1 ELSE 0 END) AS conversations_5min_plus,
-         SUM(CASE WHEN duration_sec > 0 THEN 1 ELSE 0 END) AS connected_calls
+         SUM(CASE WHEN duration_sec > 0 THEN 1 ELSE 0 END) AS connected_calls,
+         AVG(CASE WHEN duration_sec > 0 THEN duration_sec END) AS avg_connected_sec
        FROM employee_calls
        WHERE tenant_id = 'default' AND employee_id = $1`,
       [id],
@@ -392,6 +425,7 @@ const getEmployeeDetails = async (req, res) => {
     const conversations5Min = Number(callsRow.conversations_5min_plus) || 0;
     const totalCalls = Number(callsRow.total_calls) || 0;
     const connectedCalls = Number(callsRow.connected_calls) || 0;
+    const avgConnectedSec = Number(callsRow.avg_connected_sec) || 0;
     const callPickupRate = totalCalls > 0
       ? Math.min(100, Math.round((connectedCalls / totalCalls) * 100))
       : 0;
@@ -435,10 +469,12 @@ const getEmployeeDetails = async (req, res) => {
           cash: cashTotal,
         },
         performance: {
-          responseTimeMin: 1.8,
+          // Same definition as the team KPI tile (avg connected-call duration); null when no calls.
+          responseTimeMin: avgConnectedSec > 0 ? Number((avgConnectedSec / 60).toFixed(1)) : null,
           pickupRate: callPickupRate,
           qualificationRate,
-          objectionHandling: Math.min(99, Math.round(qualificationRate * 0.95) || 0),
+          // No sound per-employee basis yet (was qualificationRate * 0.95); left empty rather than invented.
+          objectionHandling: null,
           conversionRate,
           followUpQuality: followUpQuality || pickupRate,
         },
@@ -698,7 +734,9 @@ const getTeamKPIs = async (req, res) => {
     const tenantId = "default";
     const { range, startDate, endDate } = req.query;
     const period = rangeQueryToPeriod(range);
-    const callColumn = "COALESCE(started_at, created_at)";
+    // Must be alias-qualified: queryTeamCallStats joins employee_calls ec with leads l,
+    // and both tables have created_at (unqualified => "Column 'created_at' is ambiguous").
+    const callColumn = "COALESCE(ec.started_at, ec.created_at)";
     const leadColumn = "COALESCE(assigned_at, created_at)";
 
     let leadCurrentFilter;

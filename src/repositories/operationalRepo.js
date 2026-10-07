@@ -1561,8 +1561,11 @@ async function listTenantCalls(tenantId, options = {}) {
   let periodSql = "";
 
   if (period && period !== "all") {
-    const filter = buildPeriodDateFilter({
+    // period "custom" + options.startDate/endDate -> inclusive From-To range (same helper as listCalls).
+    const filter = buildPeriodOrCustomDateFilter({
       period,
+      startDate: options.startDate || null,
+      endDate: options.endDate || null,
       column: "COALESCE(ec.started_at, ec.created_at)",
       paramOffset: 2,
     });

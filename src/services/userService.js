@@ -1,5 +1,5 @@
 const pool = require("../../config/db");
-const { hashPassword, verifyPassword, generateTempPassword } = require("../utils/password");
+const { hashPassword, verifyPassword, generateTempPassword, validateNewPassword } = require("../utils/password");
 
 function normalizeLoginKey(value) {
   return String(value || "").trim().toLowerCase();
@@ -213,8 +213,14 @@ async function changePassword(userId, currentPassword, newPassword) {
     err.statusCode = 400;
     throw err;
   }
-  if (String(newPassword).length < 6) {
-    const err = new Error("New password must be at least 6 characters");
+  const policyError = validateNewPassword(newPassword);
+  if (policyError) {
+    const err = new Error(policyError);
+    err.statusCode = 400;
+    throw err;
+  }
+  if (currentPassword === newPassword) {
+    const err = new Error("New password must be different from your current password");
     err.statusCode = 400;
     throw err;
   }

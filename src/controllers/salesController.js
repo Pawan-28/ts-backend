@@ -666,8 +666,15 @@ const getOppCategoryLeads = async (req, res) => {
 };
 const getSalesAiInsights = async (req, res) => {
   try {
-    const { employee, service } = req.query;
-    const data = await dataService.getSalesAiInsights(undefined, { employee, service });
+    const { employee, service, period, range, startDate, endDate } = req.query;
+    const data = await dataService.getSalesAiInsights(undefined, {
+      employee,
+      service,
+      period: period || range || "month",
+      rangeKey: range || period,
+      startDate,
+      endDate,
+    });
     res.json(data);
   } catch (error) {
     console.error("sales-ai-insights error:", error);
