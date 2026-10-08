@@ -44,3 +44,15 @@ test("the one-time clean-up script is a dry run unless --apply is given, backs u
   assert.match(s, /temperature = BINARY 'warm'/, "only the bare default, case-sensitive");
   assert.match(s, /--restore/);
 });
+
+test("Gemini says Not Interested -> the lead goes to the Not Interested stage (early funnel only, latest call only)", () => {
+  const ai = read("src/services/aiService.js");
+  assert.match(ai, /if \(temperature === "Not Interested"\) \{[\s\S]{0,200}moveLeadToNotInterestedIfEarly\(\{ tenantId, call \}\)/);
+  const fn = ai.slice(ai.indexOf("async function moveLeadToNotInterestedIfEarly"), ai.indexOf("/** Merge one call's AI extraInfo"));
+  assert.match(ai, /const NOT_INTERESTED_FROM = new Set\(\["lead", "not_pick", "short_call", "conversation_2min"\]\);/, "meeting booked / done / proposal / objection / paid are never dropped");
+  assert.match(fn, /if \(!NOT_INTERESTED_FROM\.has\(mapStageToId\(lead\.pipeline_stage, lead\.status\)\)\) return false;/);
+  assert.match(fn, /COALESCE\(started_at, created_at\) > \$2 LIMIT 1/, "an old call that is re-processed cannot undo a newer conversation");
+  assert.match(fn, /stage: "Not Interested"/);
+  assert.match(fn, /actorName: "Gemini AI"/);
+  assert.match(ai, /moveLeadToNotInterestedIfEarly, \/\/ exported for tests/);
+});

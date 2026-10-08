@@ -3,6 +3,7 @@ const { logger } = require("../config/logger");
 const { aiSummarySkipReason } = require("../utils/callMetrics");
 const { mergeExtraInfo, extraInfoPromptBlock, EXTRA_INFO_JSON_EXAMPLE } = require("../utils/extraInfo");
 const { temperatureLabel, temperaturePromptBlock } = require("../utils/leadTemperature");
+const { mapStageToId } = require("../utils/pipelineStages");
 
 // AI Call Summary & MoM now runs on Google Gemini (was OpenAI Whisper + gpt-4o-mini).
 // Key comes from the server environment only (GEMINI_API_KEY) — never sent to the
@@ -731,6 +732,14 @@ ${EXTRA_INFO_JSON_EXAMPLE}
        WHERE id = $2`,
       [temperature, call.lead_id]
     );
+    // Gemini heard "not interested": the lead goes to the Not Interested stage of the pipeline (never fails the MoM).
+    if (temperature === "Not Interested") {
+      try {
+        await moveLeadToNotInterestedIfEarly({ tenantId, call });
+      } catch (err) {
+        logger.warn("Could not move the lead to Not Interested after the AI call analysis", { callId, error: err.message });
+      }
+    }
   }
 
   // Customer-level Extra Info: fold this call's AI values into the lead's profile (leads.source_meta.extraInfo). A later
@@ -757,6 +766,38 @@ ${EXTRA_INFO_JSON_EXAMPLE}
   // row, so API consumers get real structure without any schema change — ai_summary
   // itself stays a plain TEXT column, unchanged, fully backward compatible with old rows.
   return { ...updatedRes.rows[0], structuredSummary, extraInfoChanged };
+}
+
+// Stages where "the customer is not interested" really means the lead is lost. Later stages (a meeting is booked / held, a proposal is
+// out, money is paid) carry commitments - a single call must never drop those out of the pipeline.
+const NOT_INTERESTED_FROM = new Set(["lead", "not_pick", "short_call", "conversation_2min"]);
+
+/**
+ * Gemini classified the customer of `call` as Not Interested -> move the lead to the Not Interested stage.
+ * Only when (a) the lead is still in the early funnel, and (b) this is the lead's LATEST call - re-processing an old call must not
+ * undo what a newer conversation said. The stage change goes through the normal stage writer (timeline + audit + pipeline refresh).
+ * @returns {Promise<boolean>} true when the stage was changed
+ */
+async function moveLeadToNotInterestedIfEarly({ tenantId, call }) {
+  if (!call?.lead_id) return false;
+  const lead = (await pool.query("SELECT id, pipeline_stage, status FROM leads WHERE id = $1 LIMIT 1", [call.lead_id])).rows[0];
+  if (!lead) return false;
+  if (!NOT_INTERESTED_FROM.has(mapStageToId(lead.pipeline_stage, lead.status))) return false;
+  const at = call.started_at || call.created_at;
+  if (at) {
+    const newer = (await pool.query(
+      "SELECT 1 AS n FROM employee_calls WHERE lead_id = $1 AND COALESCE(started_at, created_at) > $2 LIMIT 1",
+      [call.lead_id, at],
+    )).rows[0];
+    if (newer) return false;
+  }
+  await require("./operationalServices").updateLeadStage({
+    tenantId,
+    leadId: lead.id,
+    stage: "Not Interested",
+    actor: { actorId: "gemini", actorName: "Gemini AI", actorRole: "system" },
+  });
+  return true;
 }
 
 /** Merge one call's AI extraInfo into leads.source_meta.extraInfo. Returns the keys that changed. */
@@ -852,4 +893,5 @@ module.exports = {
   processCallWithAi,
   ensureAllCallsProcessedWithAi,
   mergeLeadExtraInfo, // exported for tests
+  moveLeadToNotInterestedIfEarly, // exported for tests
 };
