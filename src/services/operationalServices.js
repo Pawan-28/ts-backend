@@ -635,7 +635,9 @@ async function assignLead({ tenantId, leadId, employeeId, method = "manual", per
   if (!employee || employee.status !== "active") throw new Error("Employee not found or inactive");
 
   const before = { ...lead };
-  const fromEmployeeId = lead.assignedTo?.id ?? lead.assignedTo;
+  // The previous owner. An un-populated lead has assignedTo = { id: undefined } (truthy but empty), which used to be taken as the
+  // owner and crashed the history / counter update AFTER the lead had already moved - resolve the real id instead.
+  const fromEmployeeId = await resolveLeadAssigneeId(tenantId, lead);
 
   const updated = await repo.updateLead(tenantId, leadId, {
     assignedTo: employee.id,
@@ -1235,6 +1237,7 @@ module.exports = {
   bulkAssign,
   processAssignmentQueue,
   getOrCreateAssignmentConfig,
+  eligibleEmployees,
   updateLeadStage,
   addLeadNote,
   recordCall,

@@ -2,6 +2,7 @@ const pool = require("../../config/db");
 const { logger } = require("../config/logger");
 const { aiSummarySkipReason } = require("../utils/callMetrics");
 const { mergeExtraInfo, extraInfoPromptBlock, EXTRA_INFO_JSON_EXAMPLE } = require("../utils/extraInfo");
+const { temperatureLabel, temperaturePromptBlock } = require("../utils/leadTemperature");
 
 // AI Call Summary & MoM now runs on Google Gemini (was OpenAI Whisper + gpt-4o-mini).
 // Key comes from the server environment only (GEMINI_API_KEY) — never sent to the
@@ -506,7 +507,7 @@ async function processCallWithAi(tenantId, callId) {
   let structuredSummary = null;
   let sentiment = "neutral";
   let rating = 0;
-  let temperature = "Warm Lead";
+  let temperature = null; // Hot / Warm / Cold / Not Interested - set only when Gemini returns one of them (else the lead keeps its own)
   let checklistProgress = [];
   let competencyScores = {};
   let extraInfoRaw = null; // customer-level Extra Info for THIS call (same Gemini call as the MoM - no second pipeline)
@@ -607,7 +608,7 @@ Generate:
        "Action Items:" — numbered tasks, each with the owner (Rep / Client) and deadline if stated.
 2. "sentiment": "positive" | "neutral" | "negative"
 3. "rating": integer 1-5
-4. "temperature": "Hot Lead" | "Warm Lead" | "Cold Lead"
+${temperaturePromptBlock()}
 5. "checklistProgress": for EACH item in the SOP qualification checklist above, an object { "question": <the checklist item text exactly as given>, "covered": true|false, "note": "<one line in English on what was said, or empty if not covered>" }. Return an empty array if no checklist was provided.
 6. "competencyScores": score the rep 0-100 on each of these five fixed dimensions, judged against the SOP script/frameworks/checklist above where provided:
    - "Product Value Alignment": how well the rep tied the product/service to the client's stated needs
@@ -679,7 +680,7 @@ ${EXTRA_INFO_JSON_EXAMPLE}
               summaryText = flattenSummaryForStorage(rawSummary);
               sentiment = analysis.sentiment || "positive";
               rating = Number(analysis.rating) || 5;
-              temperature = analysis.temperature || "Warm Lead";
+              temperature = temperatureLabel(analysis.temperature);
               checklistProgress = Array.isArray(analysis.checklistProgress) ? analysis.checklistProgress : [];
               competencyScores = (analysis.competencyScores && typeof analysis.competencyScores === "object")
                 ? analysis.competencyScores
@@ -726,7 +727,7 @@ ${EXTRA_INFO_JSON_EXAMPLE}
   if (call.lead_id && transcript && transcriptSource) {
     await pool.query(
       `UPDATE leads
-       SET temperature = $1, status = COALESCE(NULLIF(status, ''), 'contacted'), updated_at = NOW()
+       SET temperature = COALESCE($1, temperature), status = COALESCE(NULLIF(status, ''), 'contacted'), updated_at = NOW()
        WHERE id = $2`,
       [temperature, call.lead_id]
     );

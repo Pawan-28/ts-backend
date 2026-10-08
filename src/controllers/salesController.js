@@ -307,6 +307,9 @@ const updateLead = async (req, res) => {
     } catch (settleErr) {
       console.error(`[meetingSync] could not settle meetings for lead ${id}`, settleErr);
     }
+    await require("../services/stageClockService").stampStageEntered({
+      tenantId: meetingTenant, leadId: Number(id), before: beforeStage, after: { stage: lead.pipeline_stage, status: lead.status },
+    });
 
     // Converted / Advanced Paid → n8n (after the successful update; never blocks/rolls back).
     if (prevStatus.rows[0]) {

@@ -1,5 +1,6 @@
 const dataService = require("../services/dataService");
 const pool = require("../../config/db");
+const { readAutoReassign, nextAutoReassign } = require("../utils/autoReassignSettings");
 
 const num = (v) => {
   const n = Number(v);
@@ -83,6 +84,7 @@ const getSettings = async (req, res) => {
     currentVersion: s.currentVersion,
     dismissedSources: s.dismissedSources || {},
     customSources: Array.isArray(s.customSources) ? s.customSources : [],
+    autoReassign: readAutoReassign(s),
     integrations: [
       { id: 1, name: "Google Sign-In", connected: false, type: "auth" },
       { id: 2, name: "Google Calendar", connected: true, type: "calendar" },
@@ -95,6 +97,9 @@ const updateSettings = async (req, res) => {
   try {
     const current = await dataService.getSettings();
     const merged = { ...current.settings, ...req.body };
+    // Auto-reassign switch: normalised here; enabledAt is stamped by the server when it is switched on.
+    if (req.body && req.body.autoReassign !== undefined) merged.autoReassign = nextAutoReassign(current.settings, req.body.autoReassign);
+    else if (current.settings && current.settings.autoReassign !== undefined) merged.autoReassign = current.settings.autoReassign;
     const touchesIncentives = req.body && (req.body.incentiveSlabs !== undefined || req.body.baseIncentiveRate !== undefined);
     const configErrors = touchesIncentives ? validateIncentiveConfig(merged) : [];
     if (configErrors.length) {

@@ -596,6 +596,7 @@ async function updatePipelineLeadStage(leadId, stage, tenantId = TENANT) {
   } catch (err) {
     console.error(`[meetingSync] could not settle meetings for lead ${leadId}`, err);
   }
+  await require("./stageClockService").stampStageEntered({ tenantId, leadId, before: beforeStage, after: { stage: dbStage, status: dbStage } });
   // Converted / Advanced Paid → n8n (after the successful update; never blocks/rolls back).
   if (prev.rows[0]) {
     require("./leadStatusWebhookService").notifyLeadStatusUpdated({ tenantId, leadId, before: prev.rows[0] });

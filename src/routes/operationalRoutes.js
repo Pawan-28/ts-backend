@@ -71,6 +71,8 @@ const meetingSync = require("../services/meetingSyncService");
 const { supersedingMeeting } = require("../utils/activeMeetings");
 const leadSourcesUtil = require("../utils/leadSources");
 const dataServiceForSettings = require("../services/dataService");
+const stageClockService = require("../services/stageClockService");
+const autoReassignService = require("../services/autoReassignService");
 const { logger } = require("../config/logger");
 const {
   buildPipelineBoardPayload,
@@ -371,6 +373,41 @@ async function loadSourceLeads(tenantId) {
   sourceListCache.set(tenantId, { at: Date.now(), leads: result.rows });
   return result.rows;
 }
+
+// 3-day stuck-lead clocks: when each lead of the caller (all leads for an admin) will be auto-assigned to another employee.
+// Empty unless an admin switched the feature on (Settings). The page turns deadlineAt into "2 days to auto-assign".
+router.get("/auto-reassign/clocks", asyncRoute(async (req, res) => {
+  const tenantId = tenant(req);
+  const settings = await stageClockService.getSettings(tenantId);
+  if (!settings.enabled) return ok(res, { enabled: false, days: settings.days, clocks: {} });
+  const admin = isAdminUser(req);
+  const employeeId = admin ? (req.query.employeeId || null) : authenticatedEmployeeId(req);
+  if (!admin && !employeeId) return res.status(403).json({ success: false, message: "Employee access required" });
+  const rows = await stageClockService.loadOpenLeadRows(tenantId, { employeeId });
+  const now = Date.now();
+  const computed = await stageClockService.clocksForLeadRows(tenantId, rows, { now, days: settings.days, floorAt: settings.enabledAt });
+  const clocks = {};
+  for (const [id, c] of computed) {
+    if (c.timed) clocks[id] = { deadlineAt: c.deadlineAt.toISOString(), daysLeft: c.daysLeft, due: c.due, column: c.column };
+  }
+  return ok(res, { enabled: true, days: settings.days, enabledAt: settings.enabledAt, now: new Date(now).toISOString(), clocks });
+}));
+
+// Admin: what the auto-reassign would do - counts per day left and the leads that are already due. Changes nothing.
+router.get("/auto-reassign/preview", asyncRoute(async (req, res) => {
+  if (!isAdminUser(req)) return res.status(403).json({ success: false, message: "Admin access required" });
+  const tenantId = tenant(req);
+  const settings = await stageClockService.getSettings(tenantId);
+  if (!settings.enabled) return ok(res, { enabled: false, days: settings.days, summary: null, due: [] });
+  const now = Date.now();
+  const rows = await stageClockService.loadOpenLeadRows(tenantId, {});
+  const clocks = await stageClockService.clocksForLeadRows(tenantId, rows, { now, days: settings.days, floorAt: settings.enabledAt });
+  const due = rows
+    .filter((r) => clocks.get(String(r.id))?.due)
+    .slice(0, 25)
+    .map((r) => ({ leadId: r.id, name: r.lead_name, assignedTo: r.assigned_to, dueSince: clocks.get(String(r.id)).deadlineAt }));
+  return ok(res, { enabled: true, days: settings.days, enabledAt: settings.enabledAt, summary: autoReassignService.summarizeClocks(clocks), due });
+}));
 
 // The sources the admin Sources page shows (plus custom ones). Every dropdown offers exactly these.
 router.get("/lead-sources", asyncRoute(async (req, res) => {

@@ -641,6 +641,13 @@ async function updateLead(tenantId, leadId, patch) {
     } catch (err) {
       console.error(`[meetingSync] could not settle meetings for lead ${updatedLead.id}`, err);
     }
+    // The 3-day stuck-lead clock starts when the lead ENTERS a stage (best effort, never throws).
+    await require("../services/stageClockService").stampStageEntered({
+      tenantId,
+      leadId: updatedLead.id,
+      before: { stage: beforeStatus.pipeline_stage, status: beforeStatus.status },
+      after: { stage: updatedLead.pipelineStage, status: updatedLead.status },
+    });
     require("../services/leadStatusWebhookService").notifyLeadStatusUpdated({
       tenantId, leadId: updatedLead.id, before: beforeStatus,
     });

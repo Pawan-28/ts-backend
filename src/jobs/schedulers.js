@@ -67,6 +67,21 @@ async function serviceDistributionTick() {
   }
 }
 
+async function autoReassignTick() {
+  if (!isPgReady()) return;
+  try {
+    const { runAutoReassign } = require("../services/autoReassignService");
+    const result = await runAutoReassign(DEFAULT_TENANT_ID, {
+      actor: { actorId: "auto-reassign", actorName: "Auto Reassign", actorRole: "system" },
+    });
+    if (result?.reassigned?.length) {
+      logger.info(`Auto-reassign tick: moved ${result.reassigned.length} of ${result.due} due lead(s).`);
+    }
+  } catch (err) {
+    logger.warn(`Auto-reassign tick failed: ${err.message}`);
+  }
+}
+
 function startSchedulers() {
   if (started) return;
   started = true;
@@ -75,16 +90,20 @@ function startSchedulers() {
   const reminderMs = Number(process.env.FOLLOWUP_REMINDER_INTERVAL_MS || 300000);
   const scheduleMs = Number(process.env.SCHEDULED_ASSIGNMENT_INTERVAL_MS || 60000);
   const serviceDistMs = Number(process.env.SERVICE_DISTRIBUTION_INTERVAL_MS || 900000);
+  const autoReassignMs = Number(process.env.AUTO_REASSIGN_INTERVAL_MS || 1800000);
 
   setInterval(processQueueTick, assignmentMs).unref();
   setInterval(followupReminderTick, reminderMs).unref();
   setInterval(scheduledAssignmentsTick, scheduleMs).unref();
   setInterval(serviceDistributionTick, serviceDistMs).unref();
+  setInterval(autoReassignTick, autoReassignMs).unref();
 
   processQueueTick();
   followupReminderTick();
   scheduledAssignmentsTick();
   serviceDistributionTick();
+  // first run a few minutes after boot (not at once), so a restart never triggers a burst
+  setTimeout(autoReassignTick, 5 * 60 * 1000).unref();
   logger.info("Operational schedulers started");
 }
 
