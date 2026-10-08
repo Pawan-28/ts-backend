@@ -391,7 +391,7 @@ async function insertLead(tenantId, data) {
       JSON.stringify(data.sourceMeta || {}),
       data.formName || null,
       data.pipelineStage || "new",
-      data.temperature || "warm",
+      data.temperature || null, // blank until Gemini / a person sets it (the column default "warm" is never used)
       data.status || "New Lead",
       data.winProbability ?? 0,
       data.expectedRevenue ?? 0,

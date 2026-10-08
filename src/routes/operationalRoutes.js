@@ -72,6 +72,7 @@ const { supersedingMeeting } = require("../utils/activeMeetings");
 const leadSourcesUtil = require("../utils/leadSources");
 const dataServiceForSettings = require("../services/dataService");
 const stageClockService = require("../services/stageClockService");
+const { resolveAssigneeId } = require("../utils/leadAssignee");
 const autoReassignService = require("../services/autoReassignService");
 const { logger } = require("../config/logger");
 const {
@@ -121,9 +122,21 @@ function denyUnlessSelfOrAdmin(req, res, ownerEmployeeId) {
 async function leadAssignedEmployeeId(tenantId, leadId) {
   const lead = await repo.findLeadById(tenantId, leadId);
   if (!lead) return { lead: null, assignedId: null };
-  const raw = lead.assignedTo?.id ?? lead.assignedTo;
+  // A lead read without populate carries an EMPTY assignedTo ({ id: undefined }) - that used to come out as NaN, i.e. "not yours",
+  // even for the real owner. Resolve the real assignee instead.
+  const raw = await resolveAssigneeId(lead, () => repo.findLeadById(tenantId, leadId, { populate: true }));
   return { lead, assignedId: raw != null ? Number(raw) : null };
 }
+
+/**
+ * Opening a lead that belongs to someone else normally makes it the opener's (existing behaviour). A lead the AUTO-REASSIGN has just
+ * moved is the exception: the previous owner's still-open page must not pull it back - that would silently undo the reassignment.
+ */
+function movedAwayByAutoReassign(lead, assignedId, selfId) {
+  return String(lead?.assignmentMethod || "") === "auto_reassign" && assignedId != null && assignedId !== selfId;
+}
+
+const LEAD_MOVED_BODY = { success: false, code: "LEAD_REASSIGNED", message: "This lead was auto-assigned to another employee." };
 
 function requireEmployeeOwnsLead(paramName = "id") {
   return asyncRoute(async (req, res, next) => {
@@ -135,6 +148,7 @@ function requireEmployeeOwnsLead(paramName = "id") {
     }
     const { lead, assignedId } = await leadAssignedEmployeeId(tenant(req), req.params[paramName]);
     if (!lead) return res.status(404).json({ success: false, message: "Lead not found" });
+    if (movedAwayByAutoReassign(lead, assignedId, selfId)) return res.status(403).json(LEAD_MOVED_BODY);
     if (assignedId !== selfId) {
       try {
         await repo.updateLead(tenant(req), lead.id, { assignedTo: selfId, assignmentStatus: "assigned" });
@@ -158,6 +172,7 @@ function requireEmployeeOwnsLeadBody(field = "leadId") {
     if (!leadId) return next();
     const { lead, assignedId } = await leadAssignedEmployeeId(tenant(req), leadId);
     if (!lead) return res.status(404).json({ success: false, message: "Lead not found" });
+    if (movedAwayByAutoReassign(lead, assignedId, selfId)) return res.status(403).json(LEAD_MOVED_BODY);
     if (assignedId !== selfId) {
       try {
         await repo.updateLead(tenant(req), lead.id, { assignedTo: selfId, assignmentStatus: "assigned" });
@@ -282,7 +297,7 @@ router.post("/leads/bulk-upload", upload.single("file"), asyncRoute(async (req, 
           source: leadData.source || "manual",
           formName: leadData.service || "",
           form_name: leadData.service || "",
-          temperature: leadData.temperature || "warm",
+          temperature: leadData.temperature || null,
           pipelineStage: leadData.pipeline_stage || "new",
           status: leadData.pipeline_stage || "New Lead",
           winProbability: leadData.win_probability ? parseInt(leadData.win_probability) : 50,
@@ -1631,7 +1646,6 @@ router.post("/webhooks/callyzer", asyncRoute(async (req, res) => {
               leadName,
               phone: clientPhone,
               source: "Callyzer",
-              temperature: "warm",
               assignedTo: employee.id,
             }, { tenantId, autoAssign: false, actor: { actorId: `employee:${employee.id}`, actorName: employee.name, actorRole: "employee" } });
             lead = newLead;

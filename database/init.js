@@ -131,7 +131,7 @@ async function initDatabase() {
         mom TEXT,
         call_summary TEXT,
         notes TEXT,
-        temperature VARCHAR(50) DEFAULT 'warm',
+        temperature VARCHAR(50) DEFAULT NULL,
         pipeline_stage VARCHAR(100) DEFAULT 'new',
         status VARCHAR(100) DEFAULT 'New Lead',
         expected_revenue DECIMAL(12, 2) DEFAULT 0,

@@ -206,7 +206,7 @@ const createLead = async (req, res) => {
         win_probability || 50, purchased || null,
         expected_close_date || null, interactions || 0,
         next_followup_date || null, mom || null, call_summary || null,
-        notes || null, temperature || "Cold Lead",
+        notes || null, temperature || null,
         pipeline_stage || "New Lead", status || "New Lead",
         expected_revenue || 0,
       ]
@@ -279,7 +279,7 @@ const updateLead = async (req, res) => {
         source=$6, keyword=$7, ad_content=$8, campaign_notes=$9,
         win_probability=$10, purchased=$11, expected_close_date=$12,
         interactions=$13, next_followup_date=$14, mom=$15,
-        call_summary=$16, notes=$17, temperature=$18,
+        call_summary=$16, notes=$17, temperature=COALESCE($18, temperature),
         pipeline_stage=$19, status=$20, expected_revenue=$21,
         updated_at=NOW()
       WHERE id=$22 RETURNING *`,
@@ -288,7 +288,7 @@ const updateLead = async (req, res) => {
         source || null, keyword || null, ad_content || null, campaign_notes || null,
         win_probability || 50, purchased || null, expected_close_date || null,
         interactions || 0, next_followup_date || null, mom || null,
-        call_summary || null, notes || null, temperature || "Cold Lead",
+        call_summary || null, notes || null, temperature || null,
         pipeline_stage || "New Lead", status || "New Lead",
         expected_revenue || 0, id,
       ]

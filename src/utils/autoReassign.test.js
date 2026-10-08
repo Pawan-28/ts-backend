@@ -102,3 +102,77 @@ test("assignLead resolves the previous owner properly (an un-populated lead has 
   assert.match(ops, /const fromEmployeeId = await resolveLeadAssigneeId\(tenantId, lead\);/);
   assert.ok(!/const fromEmployeeId = lead\.assignedTo\?\.id \?\? lead\.assignedTo;/.test(ops));
 });
+
+// ------------------------------------------------------------------------ who gets the lead: the lead's SERVICE GROUP
+const { matchServiceForLead, candidatesForLead, bareServiceName } = require("./autoReassignPlan");
+const SERVICES = [
+  { name: "Podcast Interview On News Channel", serviceId: "SRV-001", distributionEnabled: true, distributionEmployeeIds: [15, 12] },
+  { name: "Book Launch With Chetan Bhagat", serviceId: "SRV-010", distributionEnabled: true, distributionEmployeeIds: [12, 10] },
+  { name: "Book Publishing", serviceId: "SRV-012", distributionEnabled: false, distributionEmployeeIds: [] },
+  { name: "TedX", serviceId: "SRV-011", distributionEnabled: true, distributionEmployeeIds: [] },
+];
+const EMPS = [10, 12, 14, 15, 16, 17].map((id) => ({ id, capacity: { currentActiveLeads: 100 + id } }));
+
+test("service of a lead: the service code first, then the exact name, then a name that contains it", () => {
+  assert.equal(matchServiceForLead({ sourceMeta: { serviceId: "SRV-010" } }, SERVICES).name, "Book Launch With Chetan Bhagat");
+  assert.equal(matchServiceForLead({ requirements: "[Service: Podcast Interview On News Channel] SOP: SOP-007" }, SERVICES).name, "Podcast Interview On News Channel");
+  assert.equal(matchServiceForLead({ sourceMeta: { service: "book publishing" } }, SERVICES).name, "Book Publishing");
+  assert.equal(matchServiceForLead({ requirements: "Podcast Interview On News Channel - 30 min" }, SERVICES).name, "Podcast Interview On News Channel");
+  assert.equal(matchServiceForLead({ requirements: "something else" }, SERVICES), null);
+  assert.equal(matchServiceForLead({}, SERVICES), null);
+  assert.equal(bareServiceName("[Service: X Y] SOP: 1"), "X Y");
+  assert.equal(bareServiceName("Service: X Y"), "X Y");
+});
+
+test("Ritik's Chetan Bhagat lead goes to the other member of that group (Sarita), never back to Ritik, never outside the group", () => {
+  const lead = { sourceMeta: { serviceId: "SRV-010" } };
+  const r = candidatesForLead(EMPS, lead, SERVICES, 10);
+  assert.equal(r.restricted, true);
+  assert.deepEqual(r.candidates.map((e) => e.id), [12]);
+  assert.equal(pickTarget(r.candidates, 10).id, 12);
+  assert.deepEqual(candidatesForLead(EMPS, lead, SERVICES, 12).candidates.map((e) => e.id), [10], "and Sarita's goes to Ritik");
+});
+
+test("a Podcast lead moves between Piyush and Sarita", () => {
+  const lead = { requirements: "[Service: Podcast Interview On News Channel]" };
+  assert.deepEqual(candidatesForLead(EMPS, lead, SERVICES, 15).candidates.map((e) => e.id), [12]);
+  assert.deepEqual(candidatesForLead(EMPS, lead, SERVICES, 12).candidates.map((e) => e.id), [15]);
+});
+
+test("a group that does not include any other eligible employee leaves the lead where it is (no fallback outside the group)", () => {
+  const lead = { sourceMeta: { serviceId: "SRV-001" } };
+  const onlyPiyush = EMPS.filter((e) => e.id !== 12); // Sarita is paused / not eligible
+  const r = candidatesForLead(onlyPiyush, lead, SERVICES, 15);
+  assert.equal(r.restricted, true);
+  assert.deepEqual(r.candidates, []);
+  assert.equal(pickTarget(r.candidates, 15), null);
+});
+
+test("no group configured (or no service match) = any eligible employee except the owner", () => {
+  for (const lead of [{ sourceMeta: { serviceId: "SRV-012" } }, { sourceMeta: { serviceId: "SRV-011" } }, { requirements: "unknown" }]) {
+    const r = candidatesForLead(EMPS, lead, SERVICES, 10);
+    assert.equal(r.restricted, false);
+    assert.deepEqual(r.candidates.map((e) => e.id), [12, 14, 15, 16, 17]);
+  }
+  assert.equal(pickTarget(candidatesForLead(EMPS, { requirements: "unknown" }, SERVICES, 10).candidates, 10).id, 12, "then the least loaded");
+});
+
+test("wiring: Sunday off, service group used, reason says working days", () => {
+  const svc = read("services/autoReassignService.js");
+  assert.match(svc, /if \(isSunday\(now\)\) return \{ skipped: "sunday" \}/);
+  assert.match(svc, /candidatesForLead\(eligible, leadLike, services, row\.assigned_to\)/);
+  assert.match(svc, /no_other_employee_in_service_group/);
+  assert.match(svc, /working days/);
+  assert.match(read("services/stageClockService.js"), /l\.requirements, l\.insights, l\.source_meta/);
+});
+
+test("an auto-reassigned lead cannot be pulled back by the previous owner's open page; the real owner is recognised", () => {
+  const routes = read("routes/operationalRoutes.js");
+  assert.match(routes, /function movedAwayByAutoReassign\(lead, assignedId, selfId\)/);
+  assert.match(routes, /assignmentMethod \|\| ""\) === "auto_reassign" && assignedId != null && assignedId !== selfId/);
+  assert.equal((routes.match(/if \(movedAwayByAutoReassign\(lead, assignedId, selfId\)\) return res\.status\(403\)\.json\(LEAD_MOVED_BODY\);/g) || []).length, 2, "both ownership guards");
+  assert.match(routes, /code: "LEAD_REASSIGNED"/);
+  // the owner is read properly (an un-populated lead has an EMPTY assignedTo, which used to come out as NaN = "not yours")
+  assert.match(routes, /const raw = await resolveAssigneeId\(lead, \(\) => repo\.findLeadById\(tenantId, leadId, \{ populate: true \}\)\);/);
+  assert.ok(!/const raw = lead\.assignedTo\?\.id \?\? lead\.assignedTo;/.test(routes));
+});

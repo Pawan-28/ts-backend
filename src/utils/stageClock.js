@@ -5,9 +5,12 @@
  * another. This module only DECIDES (pure, no database): when did the lead enter its current stage, when does the window end, and how
  * long is left. The worker (services/autoReassignService) and the cards / lead panel all use the same answer.
  *
- * The clock only runs for the early funnel, where a rep has to keep a lead moving:
- *   Lead -> Not Pick -> Short Call -> Conversation        (Meeting Booked / Done / Proposal / Objection / paid / Not Interested: no clock)
- * A lead the AI marked "Not Interested" has no clock either - recycling it to another rep would be pointless.
+ * The clock only runs for the leads that have NOT been talked to properly:
+ *   Lead, Not Pick, Short Call
+ * Conversation (answered above 2 min) and everything after it (Meeting Booked / Done / Proposal / Objection / paid / Not Interested)
+ * have no clock. A lead the AI marked "Not Interested" has no clock either - recycling it to another rep would be pointless.
+ *
+ * The 3 days are WORKING days: the clock stops on Sunday (India time), so a Sunday inside the window adds one day (utils/workingTime).
  *
  * "Entered the stage" =
  *   - the time of the stage move (stored stage), or
@@ -20,12 +23,14 @@
 const { mapStageToId } = require("./pipelineStages");
 const { callBucket } = require("./callMetrics");
 const { normalizeTemperature } = require("./leadTemperature");
+const { addWorkingMs, workingMsBetween, isSunday } = require("./workingTime");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_WINDOW_DAYS = 3;
 
+// Conversation keeps its rank (the calls can lift a lead into it), but it is NOT a timed stage.
 const COLUMN_RANK = { lead: 0, not_pick: 1, short_call: 2, conversation_2min: 3 };
-const TIMED_COLUMNS = new Set(Object.keys(COLUMN_RANK));
+const TIMED_COLUMNS = new Set(["lead", "not_pick", "short_call"]);
 
 /** One call -> the pipeline column it puts the person in (same mapping as the Pipeline), or null when it counts for nothing. */
 function callColumn(call) {
@@ -93,6 +98,8 @@ function computeStageClock({ stage, status, temperature, calls = [], stageEntere
     column = storedId;
     entered = storedMs;                                      // a stage move with no later call
   }
+  // The calls can lift a lead into Conversation: from then on it has no clock.
+  if (!TIMED_COLUMNS.has(column)) return { timed: false, reason: "stage", column };
   if (entered == null) entered = toMs(assignedAt) ?? toMs(createdAt);
 
   // The window restarts when the lead is (re)assigned and never starts before the feature was switched on.
@@ -100,8 +107,11 @@ function computeStageClock({ stage, status, temperature, calls = [], stageEntere
   if (!anchorMs) return { timed: false, reason: "no_time", column };
 
   const nowMs = toMs(now);
-  const deadlineMs = anchorMs + days * DAY_MS;
-  const msLeft = deadlineMs - nowMs;
+  // `days` of WORKING time (Sunday does not count): the deadline already includes any Sunday in between.
+  const deadlineMs = addWorkingMs(anchorMs, days * DAY_MS);
+  const due = nowMs >= deadlineMs;
+  // working time left; frozen while it is Sunday; negative once overdue
+  const msLeft = due ? deadlineMs - nowMs : workingMsBetween(nowMs, deadlineMs);
   return {
     timed: true,
     column,
@@ -109,15 +119,17 @@ function computeStageClock({ stage, status, temperature, calls = [], stageEntere
     deadlineAt: new Date(deadlineMs),
     msLeft,
     daysLeft: Math.max(0, Math.ceil(msLeft / DAY_MS)),
-    due: msLeft <= 0,
+    due,
+    paused: !due && isSunday(nowMs),
   };
 }
 
-/** "3 days to auto-assign" / "2 days ..." / "1 day ..." / "Auto-assigning soon". null when the lead has no clock. */
+/** "3 days to auto-assign" / "2 days ..." / "1 day ..." / "Paused on Sunday · 2 days left" / "Auto-assigning soon". null = no clock. */
 function autoAssignLabel(clock) {
   if (!clock || !clock.timed) return null;
   if (clock.due || clock.daysLeft <= 0) return "Auto-assigning soon";
-  return `${clock.daysLeft} ${clock.daysLeft === 1 ? "day" : "days"} to auto-assign`;
+  const left = `${clock.daysLeft} ${clock.daysLeft === 1 ? "day" : "days"}`;
+  return clock.paused ? `Paused on Sunday · ${left} left` : `${left} to auto-assign`;
 }
 
 module.exports = {

@@ -87,7 +87,7 @@ function normalizeLeadInput(input = {}) {
     source: normalizeSource(candidateSource),
     formName: input.formName || input.form_name || (servicesFormatted ? servicesFormatted : (utmCampaign ? utmCampaign : "n8n Webhook")),
     pipelineStage: input.pipelineStage || input.pipeline_stage || "new",
-    temperature: normalizeTemperature(input.temperature || input.status || input.priority),
+    temperature: normalizeTemperature(input.temperature), // blank unless the sender gave one - Gemini fills it after a connected call
     status: input.status || "New Lead",
     winProbability: Number(input.winProbability ?? input.win_probability ?? 0),
     expectedRevenue: Number(input.expectedRevenue ?? input.expected_revenue ?? input.revenue ?? 0),
@@ -115,11 +115,17 @@ function normalizeSource(value) {
   return value ? String(value).trim() : "manual";
 }
 
+/**
+ * Hot / Warm / Cold is BLANK until Gemini decides it (after a connected call) or a person picks one. So intake never invents one:
+ * only an explicit temperature from the sender counts; anything else (empty, "New Lead", a priority ...) stays blank = null.
+ */
 function normalizeTemperature(value) {
-  const s = String(value || "").toLowerCase();
+  const s = String(value || "").toLowerCase().trim();
+  if (!s) return null;
   if (s.includes("hot") || s.includes("critical") || s.includes("high")) return "hot";
   if (s.includes("cold") || s.includes("low")) return "cold";
-  return "warm";
+  if (s.includes("warm") || s.includes("medium")) return "warm";
+  return null;
 }
 
 function normalizePriority(value) {

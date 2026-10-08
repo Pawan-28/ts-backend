@@ -15,7 +15,13 @@ const { logger } = require("../config/logger");
 const { DAY_MS, autoAssignLabel } = require("../utils/stageClock");
 const { getStageLabelById } = require("../utils/pipelineStages");
 const stageClock = require("./stageClockService");
-const { summarizeClocks, pickTarget } = require("../utils/autoReassignPlan");
+
+const parseMeta = (v) => {
+  if (v && typeof v === "object") return v;
+  try { const p = JSON.parse(v || "{}"); return p && typeof p === "object" ? p : {}; } catch { return {}; }
+};
+const { summarizeClocks, pickTarget, candidatesForLead } = require("../utils/autoReassignPlan");
+const { isSunday } = require("../utils/workingTime");
 
 const DEFAULT_LIMIT = Number(process.env.AUTO_REASSIGN_MAX_PER_RUN) || 50;
 let running = false;
@@ -37,6 +43,7 @@ async function findDueLeads(tenantId, { now = Date.now(), settings } = {}) {
 async function runAutoReassign(tenantId, { now = Date.now(), limit = DEFAULT_LIMIT, dryRun = false, actor } = {}) {
   const settings = await stageClock.getSettings(tenantId);
   if (!settings.enabled) return { skipped: "disabled" };
+  if (isSunday(now)) return { skipped: "sunday" }; // the clock is stopped on Sunday - nothing is moved either
   if (running) return { skipped: "already_running" };
   running = true;
   try {
@@ -50,7 +57,8 @@ async function runAutoReassign(tenantId, { now = Date.now(), limit = DEFAULT_LIM
     }
 
     const config = await ops.getOrCreateAssignmentConfig(tenantId);
-    const candidates = await ops.eligibleEmployees(tenantId, config);
+    const eligible = await ops.eligibleEmployees(tenantId, config);
+    const { services = [] } = await require("./dataService").listServices(tenantId);
     const load = new Map();
     for (const { row, clock } of batch) {
       try {
@@ -60,8 +68,11 @@ async function runAutoReassign(tenantId, { now = Date.now(), limit = DEFAULT_LIM
         const sameTime = fresh && (new Date(fresh.assigned_at || 0).getTime() === new Date(row.assigned_at || 0).getTime());
         if (!fresh || Number(fresh.is_deleted) !== 0 || !sameOwner || !sameTime) { result.skipped.push({ leadId: row.id, reason: "changed" }); continue; }
 
+        // The new owner comes from the lead's SERVICE GROUP (the same distribution list that hands out new leads of that service).
+        const leadLike = { requirements: row.requirements, insights: row.insights, sourceMeta: parseMeta(row.source_meta) };
+        const { candidates, service, restricted } = candidatesForLead(eligible, leadLike, services, row.assigned_to);
         const target = pickTarget(candidates, row.assigned_to, load);
-        if (!target) { result.skipped.push({ leadId: row.id, reason: "no_other_employee" }); continue; }
+        if (!target) { result.skipped.push({ leadId: row.id, reason: restricted ? "no_other_employee_in_service_group" : "no_other_employee" }); continue; }
 
         const stageLabel = getStageLabelById(clock.column);
         await ops.assignLead({
@@ -70,7 +81,7 @@ async function runAutoReassign(tenantId, { now = Date.now(), limit = DEFAULT_LIM
           employeeId: target.id,
           method: "auto_reassign",
           performedBy: "auto-reassign",
-          reason: `No movement out of "${stageLabel}" for ${settings.days} days`,
+          reason: `No movement out of "${stageLabel}" for ${settings.days} working days${service ? ` (service: ${service.name})` : ""}`,
           actor,
         });
         load.set(String(target.id), (load.get(String(target.id)) ?? (target.capacity?.currentActiveLeads || 0)) + 1);
@@ -85,7 +96,7 @@ async function runAutoReassign(tenantId, { now = Date.now(), limit = DEFAULT_LIM
             entityId: row.id,
           });
         } catch { /* the lead is already moved - the notice is a courtesy */ }
-        result.reassigned.push({ leadId: row.id, from: row.assigned_to, to: target.id, stage: stageLabel });
+        result.reassigned.push({ leadId: row.id, from: row.assigned_to, to: target.id, stage: stageLabel, service: service ? service.name : null });
       } catch (err) {
         logger.warn("Auto-reassign failed for a lead", { leadId: row.id, error: err.message });
         result.skipped.push({ leadId: row.id, reason: err.message });

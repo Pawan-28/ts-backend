@@ -61,7 +61,7 @@ async function loadOpenLeadRows(tenantId, { employeeId = null, assignedBefore = 
   if (assignedBefore) { params.push(assignedBefore); where += ` AND (l.assigned_at IS NULL OR l.assigned_at <= $${params.length})`; }
   const res = await pool.query(
     `SELECT l.id, l.lead_name, l.phone, l.pipeline_stage, l.status, l.temperature, l.assigned_to, l.assigned_at, l.created_at,
-            l.assignment_status, l.source_meta
+            l.assignment_status, l.requirements, l.insights, l.source_meta
      FROM leads l WHERE ${where}`,
     params,
   );

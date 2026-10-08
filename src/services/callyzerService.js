@@ -568,7 +568,7 @@ async function autoCreateLeadForPhone(tenantId, employeeId, phone, name) {
       `INSERT INTO leads (tenant_id, lead_name, phone, pipeline_stage, status, temperature, assigned_to, source, company_name)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING id`,
-      [tenantId, name || "Unknown Lead", phone, "new", "new", "warm", employeeId, "Callyzer", "Callyzer Call"]
+      [tenantId, name || "Unknown Lead", phone, "new", "new", null, employeeId, "Callyzer", "Callyzer Call"]
     );
     const newId = result.rows[0].id;
 
