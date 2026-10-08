@@ -286,8 +286,8 @@ async function geminiUploadFile(apiKey, buffer, mimeType, displayName) {
   if (!done.ok) throw new Error(`Gemini file upload failed (${done.status})`);
   let file = (await done.json())?.file;
 
-  // Audio files are processed asynchronously — wait until ACTIVE (max ~60s).
-  for (let i = 0; file && file.state === "PROCESSING" && i < 30; i += 1) {
+  // Audio files are processed asynchronously — wait until ACTIVE. A long call (45+ min) needs more than 60 s: wait up to ~4 min.
+  for (let i = 0; file && file.state === "PROCESSING" && i < 120; i += 1) {
     await new Promise((r) => setTimeout(r, 2000));
     const poll = await fetch(`${GEMINI_API_BASE}/v1beta/${file.name}`, { headers: geminiHeaders(apiKey) });
     if (!poll.ok) break;
