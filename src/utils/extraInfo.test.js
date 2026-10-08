@@ -51,7 +51,11 @@ test("normalisation: enums are exact, free text is trimmed and short, junk is dr
   assert.deepEqual(normalizeExtraInfo({ budget: { x: 1 }, requirement: ["a"] }), {});
   assert.deepEqual(normalizeExtraInfo(null), {});
   assert.deepEqual(normalizeExtraInfo("text"), {});
-  assert.ok(normalizeExtraInfo({ requirement: "x".repeat(500) }).requirement.length <= 160);
+  // a full sentence is kept whole (it used to be cut at 160 characters); only an absurdly long value is capped
+  const long = "The client requested details on the broadcast channels and display options, asked how distribution works across regional platforms, and wants the pricing sheet shared before Friday so the partners can review it together.";
+  assert.ok(long.length > 160);
+  assert.equal(normalizeExtraInfo({ requirement: long }).requirement, long);
+  assert.ok(normalizeExtraInfo({ requirement: "x".repeat(900) }).requirement.length <= 500);
 });
 
 test("CALL 1 budget not discussed -> CALL 2 customer says 2 lakh -> Extra Info becomes 2 lakh (one field, not one per call)", () => {

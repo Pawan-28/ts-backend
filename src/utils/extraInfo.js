@@ -35,7 +35,7 @@ const EXTRA_INFO_FIELDS = [
   { key: "conversion", label: "Conversion", kind: "enum", values: ["Converted", "Not converted", "Pending"] },
 ];
 const FIELD_BY_KEY = new Map(EXTRA_INFO_FIELDS.map((f) => [f.key, f]));
-const MAX_LEN = 160;
+const MAX_LEN = 500; // generous: a value is only cut when it is absurdly long
 
 /** Values that mean "nothing was said" - never stored, never allowed to overwrite a known value. */
 const EMPTY_PATTERNS = [
