@@ -6,6 +6,7 @@ const { cacheGet, cacheSet } = require("../config/redis");
 const pool = require("../../config/db");
 const googleMeet = require("./googleMeetService");
 const { extractWebhookMeeting } = require("../utils/webhookMeeting");
+const { resolveAssigneeId } = require("../utils/leadAssignee");
 const meetingSync = require("./meetingSyncService");
 const { mapStageToId } = require("../utils/pipelineStages");
 
@@ -316,7 +317,9 @@ async function createLead(input, options = {}) {
       tenantId,
       input,
       lead: updatedLead,
-      employeeId: getEmpId(updatedLead.assignedTo) || getEmpId(updatedLead.assigned_to) || getEmpId(existingLead.assignedTo) || getEmpId(existingLead.assigned_to),
+      // The employee this very call assigned wins; else the lead's current assignee. A lead read without populate carries an EMPTY
+      // assignedTo ({}), so that is never trusted here - scheduleWebhookMeeting looks the real assignee up when this is empty.
+      employeeId: updateFields.assignedTo || getEmpId(updatedLead.assignedTo) || getEmpId(updatedLead.assigned_to) || getEmpId(existingLead.assignedTo) || getEmpId(existingLead.assigned_to),
       serviceName: input.services || input.service || input.serviceName || input.service_name || rawReqs,
       actor: options.actor,
     });
@@ -901,6 +904,9 @@ async function scheduleWebhookMeeting({ tenantId, input, lead, employeeId, servi
         console.error("[webhookMeeting] provider lookup failed", e);
       }
     }
+    // A customer who booked on a lead that ALREADY existed (Meta-ad lead first, booking sent as an update minutes later) reaches
+    // here with an empty assignee when the lead object came back un-populated. Read the lead's real assignee before giving up.
+    if (!employeeId) employeeId = await resolveLeadAssigneeId(tenantId, lead);
     if (!employeeId) {
       console.warn(`[webhookMeeting] Lead #${lead?.id}: meeting in payload but no assigned employee / matching provider "${sched.providerName || ""}" — not saved`, sched.rawTime || sched.meetLink);
       return null;
@@ -937,6 +943,16 @@ ${agenda}`;
     return saved;
   } catch (err) {
     console.error(`[webhookMeeting] Lead #${lead?.id}: failed to save meeting`, err);
+    return null;
+  }
+}
+
+/** The employee a lead is assigned to (see utils/leadAssignee: an un-populated lead has an EMPTY assignedTo {}). */
+async function resolveLeadAssigneeId(tenantId, lead) {
+  try {
+    return await resolveAssigneeId(lead, () => (lead?.id ? repo.findLeadById(tenantId, lead.id, { populate: true }) : null));
+  } catch (e) {
+    console.error(`[webhookMeeting] Lead #${lead?.id}: could not read the assignee`, e);
     return null;
   }
 }
