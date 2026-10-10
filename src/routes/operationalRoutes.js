@@ -880,6 +880,15 @@ router.post("/employee/calls", validate(callSchema), requireEmployeeSelfBody("em
     return res.status(400).json({ success: false, message: `Employee ${req.body.employeeId} not found` });
   }
   const call = await recordCall({ tenantId, data: req.body, actor: actor(req) });
+  // A manually logged call moves the person through the pipeline like a synced one (more than 2 min answered = Conversation) -
+  // every lead row of that phone, whoever made the call. Never fails the request.
+  if (call?.id) {
+    await require("../services/autoPipelineStageService").applyCallToLeadStage({
+      tenantId,
+      leadId: lead.id,
+      call: { direction: call.direction ?? req.body.direction, outcome: call.outcome ?? req.body.outcome, durationSec: Number(call.durationSec ?? req.body.durationSec) || 0 },
+    });
+  }
   // Fire AI MoM generation immediately in background for every new call
   if (call?.id) {
     const { processCallWithAi } = require("../services/aiService");
