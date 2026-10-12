@@ -6,6 +6,7 @@ const entityId = z.union([
 ]);
 
 const objectId = entityId;
+const { isPlausibleLeadPhone } = require("../utils/phone");
 
 const createLeadSchema = z.object({
   leadName: z.string().optional(),
@@ -14,7 +15,7 @@ const createLeadSchema = z.object({
   companyName: z.string().optional(),
   company_name: z.string().optional(),
   company: z.string().optional(),
-  phone: z.string().optional(),
+  phone: z.string().optional().refine((v) => isPlausibleLeadPhone(v), { message: "Enter a valid 10-digit mobile number (it starts with 6, 7, 8 or 9)" }),
   email: z.string().email().optional().or(z.literal("")),
   city: z.string().optional(),
   source: z.string().optional(),

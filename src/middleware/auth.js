@@ -1,14 +1,23 @@
 const { verifyToken } = require("../utils/token");
 const { findUserById, serializeUser } = require("../services/userService");
 
+// Only these can be called without a login: the login itself and the machine-to-machine webhooks (n8n, Callyzer, public forms).
+// The SOP routes used to be listed here too - they are now behind the login (writes: admin only, see accessPolicy.js).
 const PUBLIC_API_PREFIXES = [
   "/api/auth/login",
   "/api/v1/webhooks/callyzer",
   "/api/v1/webhooks/n8n",
   "/api/v1/webhooks/forms",
-  "/api/sop",
-  "/api/v1/sops",
 ];
+
+/**
+ * Local development only: trust the x-user-role / x-user-id headers when there is no token.
+ * It is OFF unless ALLOW_HEADER_AUTH=true and it can never be switched on in production
+ * (before, a request with no / a bad token was simply treated as the admin).
+ */
+function headerAuthAllowed() {
+  return process.env.ALLOW_HEADER_AUTH === "true" && process.env.NODE_ENV !== "production";
+}
 
 function isPublicApiPath(path) {
   return PUBLIC_API_PREFIXES.some((p) => path === p || path.startsWith(`${p}/`));
@@ -39,6 +48,24 @@ function requestApiPath(req) {
   return combined.startsWith("/") ? combined : `/${combined}`;
 }
 
+function headerIdentity(req) {
+  const roleHeader = req.headers["x-user-role"] || req.headers["x-role"];
+  const user = {
+    id: req.headers["x-user-id"] || "1",
+    name: req.headers["x-user-name"] || (roleHeader === "employee" ? "Employee" : "Admin"),
+    role: roleHeader === "employee" ? "employee" : "admin",
+    employeeId: req.headers["x-user-id"] && !isNaN(Number(req.headers["x-user-id"])) ? Number(req.headers["x-user-id"]) : null,
+  };
+  req.user = user;
+  req.headers["x-tenant-id"] = req.headers["x-tenant-id"] || "default";
+  req.headers["x-user-role"] = user.role;
+  req.headers["x-user-name"] = user.name;
+}
+
+function rejectUnauthenticated(res, message, code = "AUTH_REQUIRED") {
+  return res.status(401).json({ success: false, code, message });
+}
+
 async function authenticate(req, res, next) {
   const apiPath = requestApiPath(req);
   if (!apiPath.startsWith("/api")) return next();
@@ -46,40 +73,34 @@ async function authenticate(req, res, next) {
 
   const token = extractBearer(req);
   if (!token) {
-    const roleHeader = req.headers["x-user-role"] || req.headers["x-role"];
-    const tenantHeader = req.headers["x-tenant-id"] || "default";
-    req.user = {
-      id: req.headers["x-user-id"] || "1",
-      name: req.headers["x-user-name"] || (roleHeader === "employee" ? "Employee" : "Admin"),
-      role: roleHeader || "admin",
-      employeeId: req.headers["x-user-id"] && !isNaN(Number(req.headers["x-user-id"])) ? Number(req.headers["x-user-id"]) : null,
-    };
-    req.headers["x-tenant-id"] = tenantHeader;
-    req.headers["x-user-role"] = req.user.role;
-    req.headers["x-user-name"] = req.user.name;
-    return next();
+    if (headerAuthAllowed()) {
+      headerIdentity(req);
+      return next();
+    }
+    return rejectUnauthenticated(res, "Please log in to continue");
+  }
+
+  let payload;
+  try {
+    payload = verifyToken(token);
+  } catch {
+    if (headerAuthAllowed()) {
+      headerIdentity(req);
+      return next();
+    }
+    return rejectUnauthenticated(res, "Your session has expired. Please log in again.", "TOKEN_INVALID");
   }
 
   try {
-    const payload = verifyToken(token);
     const userRow = await findUserById(payload.sub);
     if (!userRow || userRow.status !== "active") {
-      return res.status(401).json({ success: false, message: "Invalid or inactive account" });
+      return rejectUnauthenticated(res, "Invalid or inactive account", "ACCOUNT_INACTIVE");
     }
     applyUserToRequest(req, userRow);
     return next();
-  } catch {
-    const roleHeader = req.headers["x-user-role"] || req.headers["x-role"];
-    req.user = {
-      id: req.headers["x-user-id"] || "1",
-      name: req.headers["x-user-name"] || (roleHeader === "employee" ? "Employee" : "Admin"),
-      role: roleHeader || "admin",
-      employeeId: req.headers["x-user-id"] && !isNaN(Number(req.headers["x-user-id"])) ? Number(req.headers["x-user-id"]) : null,
-    };
-    req.headers["x-tenant-id"] = req.headers["x-tenant-id"] || "default";
-    req.headers["x-user-role"] = req.user.role;
-    req.headers["x-user-name"] = req.user.name;
-    return next();
+  } catch (err) {
+    // A database hiccup is not "logged out" - the client must not clear the session for it.
+    return res.status(503).json({ success: false, code: "AUTH_UNAVAILABLE", message: "Could not verify your session right now. Please try again." });
   }
 }
 
@@ -171,6 +192,7 @@ function scopeEmployeeQuery(field = "employeeId") {
 
 module.exports = {
   authenticate,
+  isPublicApiPath,
   requireAdmin,
   requireEmployee,
   applyUserToRequest,

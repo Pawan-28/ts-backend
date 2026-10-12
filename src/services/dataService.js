@@ -135,15 +135,16 @@ function mapLeadToPipelineColumn(row) {
 }
 
 function mapLeadToTemperature(row) {
-  const priority = tempToPriority(row.temperature || row.priority);
-  if (priority === "HOT") return "Hot";
-  if (priority === "COLD") return "Cold";
-  return "Warm";
+  const t = String(row.temperature || row.priority || "").toLowerCase();
+  if (t.includes("hot")) return "Hot";
+  if (t.includes("cold")) return "Cold";
+  if (t.includes("warm")) return "Warm";
+  return "Unrated"; // no temperature chosen yet - not a Warm lead
 }
 
 function buildPipelineStatusGrid(rows) {
   const stages = ["Contacted", "Qualified", "Meeting", "Negotiation", "Conversion"];
-  const temps = ["Hot", "Warm", "Cold"];
+  const temps = ["Hot", "Warm", "Cold", "Unrated"];
   const grid = {};
   temps.forEach((t) => {
     grid[t] = {};

@@ -3,7 +3,8 @@ const pool = require("../../config/db");
 const { CALL_CONVERSATION_MIN_SEC, shouldGenerateAiSummary } = require("../utils/callMetrics");
 const { formatUtcInstantAsAppSql, parseCallyzerCallInstant } = require("../utils/appTimezone");
 const privateContactsRepo = require("../repositories/privateContactsRepo");
-const { toIndianMobile10, toCallyzerNumber } = require("../utils/phone");
+const { toIndianMobile10, toCallyzerNumber, leadNameFromCallClient } = require("../utils/phone");
+const { loadStaffPhoneSet, isStaffPhone } = require("../utils/staffPhones");
 
 const BASE_URL = (process.env.CALLYZER_API_BASE_URL || "https://api1.callyzer.co/api/v2.1").replace(/\/$/, "");
 const MIN_INTERVAL_MS = 2100;
@@ -612,9 +613,10 @@ async function getCallsForEmployee(tenantId, employee, { dbCalls = [], leads = [
   }
 
   try {
-    const [logs, privatePhonesList] = await Promise.all([
+    const [logs, privatePhonesList, staffPhones] = await Promise.all([
       fetchCallHistory({ empNumbers, days, maxPages }),
       privateContactsRepo.getPrivatePhoneNumbers(tenantId, employee.id).catch(() => []),
+      loadStaffPhoneSet(tenantId),
     ]);
     const privatePhones = new Set(privatePhonesList || []);
     
@@ -624,6 +626,9 @@ async function getCallsForEmployee(tenantId, employee, { dbCalls = [], leads = [
       const clientLast10 = digitsOnly(log.client_number || "").slice(-10);
       if (clientLast10 && privatePhones.has(clientLast10)) {
         return false; // Skip private contact calls
+      }
+      if (isStaffPhone(staffPhones, log.client_number)) {
+        return false; // a colleague's number - not a lead (no auto-created "lead", no pickup / conversation numbers)
       }
 
       const logEmpNum = digitsOnly(log.emp_number || "");
@@ -663,13 +668,13 @@ async function getCallsForEmployee(tenantId, employee, { dbCalls = [], leads = [
       
       if (!leadId) {
         const clientPhone = normalizePhone(log.client_country_code, log.client_number).full || log.client_number;
-        const leadName = log.client_name || "Unknown Lead";
+        const leadName = leadNameFromCallClient(log.client_name);
         leadId = await autoCreateLeadForPhone(tenantId, employee.id, clientPhone, leadName);
       }
 
       if (!dbCallyzerIds.has(log.id)) {
         const mapped = mapLogToCall(log, employee.id, leadId);
-        
+
         try {
           const insertRes = await pool.query(
             `INSERT INTO employee_calls (

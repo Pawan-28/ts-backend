@@ -127,7 +127,9 @@ test("AI prompt contract: asks for every field, forbids guessing, and uses PLACE
 
 test("the existing single Gemini call carries Extra Info (no second AI pipeline) and the MoM text path is untouched", () => {
   const src = fs.readFileSync(path.resolve(__dirname, "../services/aiService.js"), "utf8");
-  assert.equal((src.match(/geminiGenerateContent\(apiKey, \{/g) || []).length, 2, "still one transcription call + one MoM call");
+  // one transcription call site + one MoM call site (the MoM call now sits in a retry loop, but it is still ONE request per attempt)
+  assert.equal((src.match(/geminiGenerateContent\(apiKey, \{/g) || []).length, 1, "one transcription call");
+  assert.equal((src.match(/geminiGenerateContent\(apiKey, momRequest\)/g) || []).length, 1, "one MoM call (retried, not duplicated)");
   assert.match(src, /\$\{extraInfoPromptBlock\(\)\}/);
   assert.match(src, /extraInfoRaw = analysis\.extraInfo/);
   assert.match(src, /mergeLeadExtraInfo\(call\.lead_id, extraInfoRaw/);

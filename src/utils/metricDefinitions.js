@@ -102,13 +102,15 @@ const STAGE_TO_FUNNEL_INDEX = Object.fromEntries(
   STAGE_TO_FUNNEL.map((m) => [m.stageId, m.funnelStage ? FUNNEL_STAGES.indexOf(m.funnelStage) : -1]),
 );
 
-const TEMPS = ["Hot", "Warm", "Cold"];
+// "Unrated" = no temperature chosen yet (it stays blank until Gemini or the rep sets it) - it is NOT a Warm lead.
+const TEMPS = ["Hot", "Warm", "Cold", "Unrated"];
 
 function leadTemperature(row) {
   const t = String(row?.temperature || row?.priority || "").toLowerCase();
   if (t.includes("hot")) return "Hot";
   if (t.includes("cold")) return "Cold";
-  return "Warm";
+  if (t.includes("warm")) return "Warm";
+  return "Unrated";
 }
 
 /** Deepest funnel index (0..4) a lead has reached, or -1. Meeting/conversation records can lift stale stages. */

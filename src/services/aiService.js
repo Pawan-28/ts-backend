@@ -3,6 +3,7 @@ const { logger } = require("../config/logger");
 const { aiSummarySkipReason } = require("../utils/callMetrics");
 const { mergeExtraInfo, extraInfoPromptBlock, EXTRA_INFO_JSON_EXAMPLE } = require("../utils/extraInfo");
 const { temperatureLabel, temperaturePromptBlock } = require("../utils/leadTemperature");
+const { parseGeminiJson } = require("../utils/geminiJson");
 const { mapStageToId } = require("../utils/pipelineStages");
 
 // AI Call Summary & MoM now runs on Google Gemini (was OpenAI Whisper + gpt-4o-mini).
@@ -28,6 +29,7 @@ const NO_RECORDING_MSG = "No call recording available for this call.";
 const GEMINI_NOT_CONFIGURED_MSG = "[AI UNAVAILABLE] GEMINI_API_KEY is not configured on the server — no MoM was generated for this call.";
 const TRANSCRIPT_UNAVAILABLE_MSG = "[TRANSCRIPT UNAVAILABLE] The call recording could not be transcribed (no speech detected or Gemini transcription failed) — no MoM was generated for this call.";
 const AI_SUMMARY_PENDING_TAG = "[AI SUMMARY PENDING]";
+const MOM_MAX_ATTEMPTS = 3; // MoM request: first try + 2 retries for transient failures / unreadable answers
 const GPT_FAILED_MSG = "[GPT FAILED] AI summarization request failed — see server logs for details.";
 
 const SECTION_LABELS = {
@@ -306,10 +308,26 @@ async function geminiUploadFile(apiKey, buffer, mimeType, displayName) {
  * at the same point in the flow (recording_url → transcript text → MoM).
  */
 async function transcribeRecordingWithGemini(apiKey, recordingUrl, callId) {
-  const audioRes = await fetch(recordingUrl);
+  let audioRes;
+  try {
+    // A stuck download used to hang the whole job for ever: give up after 3 minutes. Some hosts refuse requests without a browser agent.
+    audioRes = await fetch(recordingUrl, {
+      redirect: "follow",
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; TSCRM/1.0)", Accept: "audio/*,*/*;q=0.8" },
+      signal: AbortSignal.timeout(180_000),
+    });
+  } catch (err) {
+    const timedOut = err?.name === "TimeoutError" || err?.name === "AbortError";
+    logger.warn("Could not reach the call recording", { callId, error: err.message });
+    return { text: "", reason: timedOut ? "recording download failed (timed out after 3 minutes)" : `recording download failed (${err.message})` };
+  }
   if (!audioRes.ok) {
     logger.warn("Could not download call recording for transcription", { callId, status: audioRes.status });
     return { text: "", reason: `recording download failed (HTTP ${audioRes.status})` };
+  }
+  const downloadType = String(audioRes.headers.get("content-type") || "").toLowerCase();
+  if (downloadType.startsWith("text/html")) {
+    return { text: "", reason: "recording download failed (the link returned a web page, not audio)" };
   }
   const buffer = Buffer.from(await audioRes.arrayBuffer());
   if (!buffer.length) return { text: "", reason: "recording file is empty" };
@@ -642,7 +660,7 @@ Return JSON with exact keys:
   },
 ${EXTRA_INFO_JSON_EXAMPLE}
 }`;
-        const geminiRes = await geminiGenerateContent(apiKey, {
+        const momRequest = {
           systemInstruction: { parts: [{ text: systemPrompt }] },
           contents: [{ role: "user", parts: [{ text: `Real Transcript:\n${transcript}` }] }],
           generationConfig: {
@@ -650,48 +668,55 @@ ${EXTRA_INFO_JSON_EXAMPLE}
             responseMimeType: "application/json",
             temperature: 0.2,
           },
-        });
-
-        if (geminiRes.ok) {
-          geminiUsage.mom = { model: geminiRes.model, ...(geminiRes.data?.usageMetadata || {}) };
-          const content = geminiResponseText(geminiRes.data);
-          if (!content) {
-            logger.error("Gemini returned an empty response body", {
-              callId,
-              finishReason: geminiRes.data?.candidates?.[0]?.finishReason || null,
-              blockReason: geminiRes.data?.promptFeedback?.blockReason || null,
-            });
-            summaryText = aiPendingSummary;
+        };
+        // One bad answer (overloaded model, an empty reply, JSON cut off on a long call) must not leave the call without a MoM:
+        // transient failures are retried, damaged JSON is repaired, and when it still fails the reason is stored with the call.
+        let analysis = null;
+        let momFailureReason = "";
+        for (let attempt = 1; attempt <= MOM_MAX_ATTEMPTS && !analysis; attempt += 1) {
+          const geminiRes = await geminiGenerateContent(apiKey, momRequest);
+          let retryable = true;
+          if (!geminiRes.ok) {
+            momFailureReason = geminiErrorReason(geminiRes.status, geminiRes.errorText);
+            logger.error("Gemini API request failed", { callId, attempt, status: geminiRes.status, error: geminiRes.errorText });
+            retryable = [408, 429, 500, 502, 503, 504].includes(geminiRes.status);
           } else {
-            let analysis;
-            try {
-              // Tolerate a ```json fenced block, just in case.
-              analysis = JSON.parse(content.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, ""));
-            } catch (parseErr) {
-              logger.error("Gemini returned invalid JSON", { callId, error: parseErr.message, content });
-              analysis = null;
-            }
-            if (!analysis || typeof analysis !== "object") {
-              summaryText = aiPendingSummary;
+            geminiUsage.mom = { model: geminiRes.model, ...(geminiRes.data?.usageMetadata || {}) };
+            const content = geminiResponseText(geminiRes.data);
+            const finish = geminiRes.data?.candidates?.[0]?.finishReason || null;
+            const blocked = geminiRes.data?.promptFeedback?.blockReason || null;
+            if (!content) {
+              momFailureReason = blocked ? `Gemini blocked the transcript (${blocked})` : `Gemini returned an empty answer${finish && finish !== "STOP" ? ` (finish: ${finish})` : ""}`;
+              logger.error("Gemini returned an empty response body", { callId, attempt, finishReason: finish, blockReason: blocked });
+              retryable = !blocked;
             } else {
-              const rawSummary = analysis.summary ?? transcript;
-              if (rawSummary && typeof rawSummary === "object" && !Array.isArray(rawSummary)) {
-                structuredSummary = rawSummary;
+              analysis = parseGeminiJson(content);
+              if (!analysis) {
+                momFailureReason = `Gemini returned an unreadable answer${finish && finish !== "STOP" ? ` (finish: ${finish})` : ""}`;
+                logger.error("Gemini returned invalid JSON", { callId, attempt, finishReason: finish, content: content.slice(0, 500) });
               }
-              summaryText = flattenSummaryForStorage(rawSummary);
-              sentiment = analysis.sentiment || "positive";
-              rating = Number(analysis.rating) || 5;
-              temperature = temperatureLabel(analysis.temperature);
-              checklistProgress = Array.isArray(analysis.checklistProgress) ? analysis.checklistProgress : [];
-              competencyScores = (analysis.competencyScores && typeof analysis.competencyScores === "object")
-                ? analysis.competencyScores
-                : {};
-              extraInfoRaw = analysis.extraInfo && typeof analysis.extraInfo === "object" ? analysis.extraInfo : null;
             }
           }
+          if (!analysis && (!retryable || attempt >= MOM_MAX_ATTEMPTS)) break;
+          if (!analysis) await new Promise((r) => setTimeout(r, attempt * 3000));
+        }
+
+        if (!analysis) {
+          summaryText = momFailureReason ? `${aiPendingSummary}\nReason: ${momFailureReason}` : aiPendingSummary;
         } else {
-          logger.error("Gemini API request failed", { callId, status: geminiRes.status, error: geminiRes.errorText });
-          summaryText = aiPendingSummary;
+          const rawSummary = analysis.summary ?? transcript;
+          if (rawSummary && typeof rawSummary === "object" && !Array.isArray(rawSummary)) {
+            structuredSummary = rawSummary;
+          }
+          summaryText = flattenSummaryForStorage(rawSummary);
+          sentiment = analysis.sentiment || "positive";
+          rating = Number(analysis.rating) || 5;
+          temperature = temperatureLabel(analysis.temperature);
+          checklistProgress = Array.isArray(analysis.checklistProgress) ? analysis.checklistProgress : [];
+          competencyScores = (analysis.competencyScores && typeof analysis.competencyScores === "object")
+            ? analysis.competencyScores
+            : {};
+          extraInfoRaw = analysis.extraInfo && typeof analysis.extraInfo === "object" ? analysis.extraInfo : null;
         }
       } catch (err) {
         logger.error("Gemini summarization threw an error", { callId, error: err.message });

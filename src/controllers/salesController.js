@@ -1,5 +1,6 @@
 const pool = require("../../config/db");
 const dataService = require("../services/dataService");
+const { isPlausibleLeadPhone } = require("../utils/phone");
 const getSalesDashboard = (req, res) => {
   res.json({
     kpis: {
@@ -188,6 +189,13 @@ const createLead = async (req, res) => {
         message: "lead_name is required and cannot be empty",
       });
     }
+    // The same phone rule as POST /api/v1/leads (this route accepted any text, e.g. 1234567890, as a phone).
+    if (!isPlausibleLeadPhone(phone)) {
+      return res.status(400).json({
+        success: false,
+        message: "Enter a valid 10-digit mobile number (it starts with 6, 7, 8 or 9)",
+      });
+    }
 
     const result = await pool.query(
       `INSERT INTO leads (
@@ -223,6 +231,7 @@ const createLead = async (req, res) => {
       action: `New lead added: ${lead.company_name || lead.lead_name}`,
       entity: "lead",
       entity_id: lead.id,
+      user_name: req.user?.name || undefined, // who did it (it used to be recorded as "Admin" for everybody)
     });
 
     await createNotification({
@@ -324,6 +333,7 @@ const updateLead = async (req, res) => {
       action: `Updated lead: ${lead.company_name || lead.lead_name}`,
       entity: "lead",
       entity_id: lead.id,
+      user_name: req.user?.name || undefined, // who did it (it used to be recorded as "Admin" for everybody)
     });
 
     await createNotification({
@@ -365,6 +375,7 @@ const deleteLead = async (req, res) => {
       action: `Deleted lead: ${leadName}`,
       entity: "lead",
       entity_id: parseInt(id),
+      user_name: req.user?.name || undefined, // who did it (it used to be recorded as "Admin" for everybody)
     });
 
     await createNotification({

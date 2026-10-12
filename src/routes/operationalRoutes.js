@@ -37,6 +37,11 @@ const {
 } = require("../utils/meetingTitle");
 const { isDateKeyInPeriod, isMeetingDateKeyInPeriod, localDateKey: periodLocalDateKey } = require("../utils/periodDateKeys");
 const { requirePg } = require("../middleware/pgReady");
+const { loadStaffPhoneSet, isStaffPhone } = require("../utils/staffPhones");
+const { redactEmployees } = require("../utils/employeePrivacy");
+const { uploadFileFilter } = require("../utils/uploadFilter");
+const { verifyN8nSecret } = require("../utils/webhookSecret");
+const { leadNameFromCallClient } = require("../utils/phone");
 const {
   isAdminUser,
   authenticatedEmployeeId,
@@ -85,6 +90,7 @@ const uploadDir = path.join(process.cwd(), "uploads");
 fs.mkdirSync(uploadDir, { recursive: true });
 const upload = multer({
   dest: uploadDir,
+  fileFilter: uploadFileFilter,
   limits: { fileSize: Number(process.env.MAX_UPLOAD_BYTES || 10 * 1024 * 1024) },
 });
 
@@ -715,7 +721,7 @@ router.get("/assignment/audit", asyncRoute(async (req, res) => {
 
 router.get("/employees", asyncRoute(async (req, res) => {
   const employees = await repo.listEmployees(tenant(req), { status: req.query.status, q: req.query.q });
-  return ok(res, employees);
+  return ok(res, redactEmployees(employees, req.user));
 }));
 
 router.post("/employees", asyncRoute(async (req, res) => {
@@ -1558,6 +1564,11 @@ router.get("/audit", asyncRoute(async (req, res) => {
 }));
 
 router.post("/webhooks/n8n", asyncRoute(async (req, res) => {
+  // Optional shared secret: when N8N_INBOUND_SECRET is set in the server environment, n8n must send it
+  // (header x-webhook-secret / x-n8n-secret). Not set = open, exactly as before.
+  if (!verifyN8nSecret(req)) {
+    return res.status(401).json({ success: false, message: "Invalid webhook secret" });
+  }
   const body = req.body || {};
   const leadName = body.leadName || body.lead_name || body.name || body.fullName;
   const phone = body.phone || body.phone_number || body.mobile || body.contact;
@@ -1610,6 +1621,7 @@ router.post("/webhooks/callyzer", asyncRoute(async (req, res) => {
   const tenantId = process.env.CALLYZER_TENANT_ID || "default";
   const payloads = Array.isArray(req.body) ? req.body : [req.body];
   const employees = await repo.listEmployees(tenantId);
+  const staffPhones = await loadStaffPhoneSet(tenantId);
   let synced = 0;
   let skipped = 0;
 
@@ -1637,6 +1649,12 @@ router.post("/webhooks/callyzer", asyncRoute(async (req, res) => {
         continue; // Strictly discard private calls
       }
 
+      // A colleague's number is not a lead: no auto-created "lead" and no call row (same rule as private contacts).
+      if (isStaffPhone(staffPhones, log.client_number)) {
+        skipped += 1;
+        continue;
+      }
+
       let lead = callyzer.findLeadForClient(assignedLeads, log.client_country_code, log.client_number);
       if (!lead) {
         lead = await repo.findLeadByPhone(tenantId, log.client_number, { assignedTo: employee.id });
@@ -1644,7 +1662,7 @@ router.post("/webhooks/callyzer", asyncRoute(async (req, res) => {
 
       if (!lead) {
         const clientPhone = callyzer.normalizePhone(log.client_country_code, log.client_number).full || log.client_number;
-        const leadName = log.client_name || "Unknown Lead";
+        const leadName = leadNameFromCallClient(log.client_name);
 
         const existingLead = await repo.findLeadByPhone(tenantId, clientPhone);
         if (existingLead) {

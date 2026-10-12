@@ -4,6 +4,7 @@ const path = require("path");
 
 const authRoutes = require("./routes/authRoutes");
 const { authenticate } = require("./middleware/auth");
+const { enforceAccessPolicy } = require("./middleware/accessPolicy");
 
 const dashboardRoutes = require("./routes/dashboardRoutes");
 const sopRoutes = require("./routes/soprouter");
@@ -32,6 +33,12 @@ const DEFAULT_FRONTEND_ORIGINS = [
 
 function isAllowedOrigin(origin) {
   if (!origin) return true;
+  if (process.env.STRICT_CORS === "true") {
+    // only the real sites: the built-in production ones + FRONTEND_URL (no localhost, no LAN, no *.vercel.app wildcard)
+    const strictList = DEFAULT_FRONTEND_ORIGINS.filter((o) => !/^http:\/\/localhost/i.test(o));
+    const listed = process.env.FRONTEND_URL ? process.env.FRONTEND_URL.split(",").map((x) => x.trim()).filter(Boolean) : [];
+    return strictList.includes(origin) || listed.includes(origin);
+  }
   if (DEFAULT_FRONTEND_ORIGINS.includes(origin)) return true;
   if (/^https:\/\/[\w-]+\.vercel\.app$/i.test(origin)) return true;
   if (/^http:\/\/localhost:\d+$/i.test(origin)) return true;
@@ -53,6 +60,16 @@ app.use(cors({
   },
   credentials: true,
 }));
+// Basic security headers (S-03). No framing, no MIME sniffing, no referrer leaks, HTTPS only for a year.
+app.disable("x-powered-by");
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  next();
+});
 app.use(express.json());
 app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
 
@@ -82,6 +99,7 @@ app.get("/", (req, res) => {
 
 app.use("/api/auth", authRoutes);
 app.use(authenticate);
+app.use(enforceAccessPolicy); // who may call what (admin / employee) - one table in middleware/accessPolicy.js
 
 app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/sop", sopRoutes);

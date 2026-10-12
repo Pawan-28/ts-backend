@@ -184,6 +184,7 @@ async function getLeadSummary(tenantId, periodInput = {}, { employee, employeeId
     hot: s.tempTotals.Hot,
     warm: s.tempTotals.Warm,
     cold: s.tempTotals.Cold,
+    unrated: s.tempTotals.Unrated,
     definitions: {
       totalLeads: `${defs.totalLeads.formula}. ${defs.totalLeads.basis}.`,
       pipelineValue: `${defs.pipelineValue.formula}. ${defs.pipelineValue.basis}.`,
@@ -462,12 +463,17 @@ async function getDashboardInsights(tenantId, periodInput = {}, filters = {}) {
     });
   }
 
+  // Ties are said out loud: when the top leads share one value, none of them is "the highest" (the order between them is arbitrary).
+  const topValue = leads[0]?.value ?? 0;
+  const tiedAtTop = leads.length > 1 && leads[1].value === topValue;
   leads.slice(0, 2).forEach((l, i) => {
     const act = NEXT_ACTION[l.stageId];
+    let label = "Open lead";
+    if (topValue > 0 && l.value === topValue) label = tiedAtTop ? "Open lead (tied for highest value)" : "Highest-value open lead";
     insights.push({
       type: act.early ? "warn" : "check",
       category: "Lead Detail",
-      title: `${i === 0 ? "Highest-value open lead" : "Open lead"}: ${l.name}`,
+      title: `${label}: ${l.name}`,
       body: `Lead "${l.name}"${money(l.value)} assigned to ${l.owner} is in "${l.stageLabel}" stage and ${act.text}.`,
       tone: act.early ? "warn" : "check",
     });

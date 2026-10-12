@@ -634,12 +634,13 @@ function mapLeadToTemperature(lead) {
   const t = String(lead?.temperature || lead?.priority || lead?.status || "").toLowerCase();
   if (t.includes("hot")) return "Hot";
   if (t.includes("cold")) return "Cold";
-  return "Warm";
+  if (t.includes("warm")) return "Warm";
+  return "Unrated"; // no temperature chosen yet - not a Warm lead
 }
 
 function buildPipelineStatusGridFromKanban(grouped = {}) {
   const stages = ["Contacted", "Qualified", "Meeting", "Negotiation", "Conversion"];
-  const temps = ["Hot", "Warm", "Cold"];
+  const temps = ["Hot", "Warm", "Cold", "Unrated"];
   const grid = {};
   temps.forEach((t) => {
     grid[t] = {};

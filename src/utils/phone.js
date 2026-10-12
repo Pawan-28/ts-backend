@@ -61,7 +61,32 @@ function toCallyzerNumber(raw) {
   return null;
 }
 
+/**
+ * Is this phone number acceptable for a NEW lead? An Indian mobile must start with 6-9 (1234567890 / 0123456789 are typos);
+ * another country's number (+65, +44 ...) and an empty value are left alone.
+ */
+function isPlausibleLeadPhone(raw) {
+  if (raw == null || String(raw).trim() === "") return true;
+  const in10 = toIndianMobile10(raw);
+  return in10 == null || /^[6-9]\d{9}$/.test(in10);
+}
+
+/** A "name" made only of digits / + - ( ) spaces (at least 7 digits) is a phone number, not a person. */
+function looksLikePhone(text) {
+  const t = String(text ?? "").trim();
+  return t.length > 0 && /^[+\d\s\-().]+$/.test(t) && digitsOnly(t).length >= 7;
+}
+
+/** The client name from a call log, or "Unknown Lead" when it is empty or just the phone number. */
+function leadNameFromCallClient(clientName) {
+  const name = String(clientName ?? "").trim();
+  return name && !looksLikePhone(name) ? name : "Unknown Lead";
+}
+
 module.exports = {
+  isPlausibleLeadPhone,
+  looksLikePhone,
+  leadNameFromCallClient,
   digitsOnly,
   toIndianMobile10,
   toE164,

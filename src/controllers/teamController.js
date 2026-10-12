@@ -1,4 +1,5 @@
 const pool = require("../../config/db");
+const { redactEmployees } = require("../utils/employeePrivacy");
 const { callSqlExprs, pickupRatePct } = require("../utils/callMetrics");
 const {
   buildPeriodDateFilter,
@@ -257,7 +258,7 @@ const getEmployees = async (req, res) => {
     );
     res.json({
       success: true,
-      employees: result.rows,
+      employees: redactEmployees(result.rows, req.user), // colleagues' salary / e-mail / phone / targets are not for other employees
       ...(periodFilter.meta || {}),
     });
   } catch (error) {
@@ -345,6 +346,7 @@ const createEmployee = async (req, res) => {
       action: `Added new employee: ${employee.name}`,
       entity: "employee",
       entity_id: employee.id,
+      user_name: req.user?.name || undefined, // who did it (it used to be recorded as "Admin" for everybody)
     });
 
    await createNotification({
@@ -642,6 +644,7 @@ const updateEmployee = async (req, res) => {
       action: `Updated employee: ${employee.name}`,
       entity: "employee",
       entity_id: employee.id,
+      user_name: req.user?.name || undefined, // who did it (it used to be recorded as "Admin" for everybody)
     });
 
    await createNotification({
@@ -684,6 +687,7 @@ const deleteEmployee = async (req, res) => {
       action: `Removed employee from team: ${employeeName}`,
       entity: "employee",
       entity_id: parseInt(id),
+      user_name: req.user?.name || undefined, // who did it (it used to be recorded as "Admin" for everybody)
     });
 
    await createNotification({

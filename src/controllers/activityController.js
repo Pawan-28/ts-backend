@@ -69,6 +69,11 @@ const globalSearch = async (req, res) => {
   }
 
   const term = `%${q.toLowerCase()}%`;
+  // An employee can only find THEIR OWN leads (search used to return every lead of the company to any logged-in user).
+  const isEmployee = req.user?.role === "employee";
+  const selfId = Number(req.user?.employeeId);
+  const ownLeadsOnly = isEmployee ? " AND assigned_to = $2" : "";
+  const ownLeadsParams = isEmployee ? [Number.isFinite(selfId) ? selfId : -1] : [];
 
   try {
     // ── Employees ──
@@ -98,9 +103,9 @@ const globalSearch = async (req, res) => {
        FROM leads
        WHERE (LOWER(COALESCE(lead_name, '')) LIKE $1
           OR LOWER(COALESCE(company_name, '')) LIKE $1)
-          AND is_deleted = 0
+          AND is_deleted = 0${ownLeadsOnly}
        LIMIT 5`,
-      [term]
+      [term, ...ownLeadsParams]
     );
 
     // ── SOPs ──
